@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Abaqus 可再生大文件
+*.odb
+*.sim
+*.prt
+*.res
+*.stt
+*.pac
+*.sel
+*.lck
+*.dat
+*.msg
+*.sta
+*.log
+*.com
+
+# 计算结果与本地临时文件
+07_RESULTS/
+temp/
+tmp/
+.vscode/
+.idea/
+
+# Historical Formal/D02 database caches; the current fixed-15mm workflow
+# reads the user-selected sample-library CSV instead.
+03_DATABASE/data/*
+!03_DATABASE/data/.gitkeep
+03_DATABASE/models/*
+!03_DATABASE/models/.gitkeep
+03_DATABASE/scalers/*

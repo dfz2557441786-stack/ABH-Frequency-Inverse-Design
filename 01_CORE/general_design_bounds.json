@@ -1,0 +1,76 @@
+{
+  "DESIGN_DOMAIN_STATUS": "numerical_pilot_only",
+  "GENERAL_MODEL_DIMENSION": 11,
+  "MATERIAL_MODEL_NOTE": "not experimentally cross-validated",
+  "MATERIAL_MODEL_STATUS": "fixed_equivalent_simulation_parameter",
+  "base_general_input": {
+    "Rou_2": 0.15728,
+    "Rou_3": 0.21564,
+    "Rou_4": 0.16879,
+    "cutoff_thickness": 0.0004,
+    "equal_t_length": 0.03,
+    "equal_t_width": 0.03,
+    "platform_height": 0.005,
+    "power_law": 3.0,
+    "rx": 0.3097339768291772,
+    "ry": 0.24652257653078194,
+    "theta": 0.8726646259971648
+  },
+  "bounds": {
+    "Rou_2": {
+      "lower": 0.13,
+      "source": "existing_config",
+      "upper": 0.19
+    },
+    "Rou_3": {
+      "lower": 0.18,
+      "source": "existing_config",
+      "upper": 0.25
+    },
+    "Rou_4": {
+      "lower": 0.14,
+      "source": "existing_config",
+      "upper": 0.2
+    },
+    "cutoff_thickness": {
+      "lower": 0.0002,
+      "source": "existing_config",
+      "upper": 0.001
+    },
+    "equal_t_length": {
+      "lower": 0.01,
+      "source": "existing_config",
+      "upper": 0.05
+    },
+    "equal_t_width": {
+      "lower": 0.01,
+      "source": "existing_config",
+      "upper": 0.05
+    },
+    "platform_height": {
+      "lower": 0.003,
+      "source": "existing_config",
+      "upper": 0.008
+    },
+    "power_law": {
+      "lower": 1.0,
+      "source": "existing_config",
+      "upper": 5.0
+    },
+    "rx": {
+      "lower": 0.1548669884145886,
+      "source": "validated_fixed_ABH_v1:PILOT_DX_DY_LIMITS_M",
+      "upper": 0.46460096524376576
+    },
+    "ry": {
+      "lower": 0.12326128826539097,
+      "source": "validated_fixed_ABH_v1:PILOT_DX_DY_LIMITS_M",
+      "upper": 0.36978386479617287
+    },
+    "theta": {
+      "lower": 0.6108652381980153,
+      "source": "existing_config",
+      "upper": 0.9599310885968813
+    }
+  }
+}
