@@ -54,7 +54,9 @@ FIXED_BASELINE_PARAMETERS = {
     "cutoff_thickness": 0.4e-3,
     "power_law": 3.0,
     "hole_radius": 4.0e-3,
-    "damp_elastic": 2994194.552,
+    # Fixed damping material now follows the checked ABH_Frequency_Dataset_V2_2
+    # reference model.  It is not a design variable.
+    "damp_elastic": 2.5831e7,
     "damp_thickness": 3.0e-3,
     # The two dimensions are the dimensions of the central rectangular
     # opening in the damping/constraint ring.  They correspond exactly to
@@ -63,22 +65,26 @@ FIXED_BASELINE_PARAMETERS = {
     "damp_width": 0.244513888852735,
 }
 
+FIXED_ALUMINUM_PARAMETERS = {
+    "density": 2.719e3,
+    "elastic": 70630000000.0,
+    "poisson": 0.32,
+    "loss_factor": 0.001,
+}
 FIXED_MATERIAL_PARAMETERS = {
-    "damp_density": 1730.0,
-    "damp_poisson": 0.45,
+    "damp_density": 2139.201679,
+    "damp_poisson": 0.4463,
     "damp_loss_factor": 0.7,
     "Constrained_Layer_thickness": 0.1e-3,
-    "constrained_elastic": 79972224765.0,
-    "constrained_density": 2243.973045,
+    "constrained_elastic": 68915063391.0,
+    "constrained_density": 2.73e3,
     "constrained_poisson": 0.33,
     "constrained_loss_factor": 0.001,
 }
 LEGACY_MATERIAL_PARAMETERS = dict(FIXED_MATERIAL_PARAMETERS)
-CALIBRATION_STATUS = "candidate_not_cross_validated"
-# The 145 MPa value is held fixed for the present finite-element study.  It is
-# intentionally not represented as an experimentally universal material value.
-MATERIAL_MODEL_STATUS = "fixed_equivalent_simulation_parameter"
-MATERIAL_MODEL_NOTE = "not experimentally cross-validated"
+CALIBRATION_STATUS = "aligned_to_ABH_Frequency_Dataset_V2_2_reference"
+MATERIAL_MODEL_STATUS = "fixed_reference_material_parameters"
+MATERIAL_MODEL_NOTE = "Al, damping and constrained-layer values match the checked ABH_Frequency_Dataset_V2_2 model"
 
 # Single source for the locked 35 Hz controlled-validation solver policy.
 # The policy is enforced in the generated input before an Abaqus job can be
@@ -146,7 +152,7 @@ RECT_PATCH_DISABLED = True
 RANGE_DISCOVERY_ONLY = True
 MATERIAL_TRANSFER_VALIDATION_STATUS = "PENDING_DATA"
 HOST_STRUCTURE_VALIDATION_STATUS = "PENDING_HOST_STRUCTURE_VALIDATION"
-FRAME_FIXED_PARAMETERS = dict(FIXED_BASELINE_PARAMETERS, damp_elastic=145.0e6,
+FRAME_FIXED_PARAMETERS = dict(FIXED_BASELINE_PARAMETERS, damp_elastic=2.5831e7,
                               damp_thickness=3.0e-3, damp_inward_x=40.0e-3,
                               damp_inward_y=40.0e-3)
 FRAME_OFAT_POINTS = (
@@ -184,7 +190,7 @@ PARAMETER_BOUNDS = {
     "platform_height": (0.003, 0.008), "platform_length": (0.015, 0.04),
     "platform_width": (0.015, 0.04), "cutoff_thickness": (0.0002, 0.001),
     "power_law": (1.0, 5.0), "hole_radius": (0.001, 0.008),
-    "damp_elastic": (145.0e6, 145.0e6), "damp_thickness": (0.003, 0.003),
+    "damp_elastic": (2.5831e7, 2.5831e7), "damp_thickness": (0.003, 0.003),
     # Formal ranges remain intentionally unset; only the recorded OFAT points are valid now.
     "damp_inward_x": None, "damp_inward_y": None,
 }
@@ -222,6 +228,38 @@ FREQUENCY9D_POLICY = {
     "min_database_distance": 0.08, "min_pair_distance": 0.12,
     "max_support_distance": 0.35, "local_halfwidth": 0.15,
     "cv_folds": 5, "primary_mode_count": 8,
+}
+# Fixed 15 mm inverse generation is intentionally conservative.  Generation may only make a new
+# geometry close to an *actual* target-matching database anchor.  A predicted
+# exact frequency alone never qualifies a candidate for Abaqus validation.
+FIXED_BAND_TARGET_GENERATION_POLICY = {
+    "candidate_count": 8, #严格通过不确定度门槛的正式候选数量
+    "match_percent": 2.0,
+    "anchor_detuning_percent": 1.0,
+    "local_trust_radius": 0.035,
+    "minimum_new_distance": 0.004,
+    "minimum_pair_distance": 0.060,
+    "maximum_prediction_std_percent": 2.0,
+    "upper_confidence_multiplier": 1.96,
+    # 严格门槛未通过时，仍可单独导出少量“探索候选”，供人工选择后
+    # 进行独立 Abaqus 验证。它们绝不写入严格候选表，也不表示频率已满足。
+    "exploratory_candidate_count": 6, #严格门槛未通过时，仍导出供 Abaqus 验证的探索候选数量。
+    "exploratory_max_prediction_std_percent": 12.0,
+}
+# 零有限元成本的模型检查：只比较实验模型，不自动替换生产模型。
+# 训练、校准、测试按独立/近重复几何分组隔离，测试结果不可回填训练。
+FIXED_BAND_MODEL_CHECK_POLICY = {
+    "version": "GROUP_HOLDOUT_CALIBRATION_1",
+    "seed": 20261015,
+    "near_duplicate_radius": 0.02,
+    "test_fraction": 0.20,
+    "calibration_fraction_of_development": 0.25,
+    "coverage": 0.95,
+    "minimum_calibration_rows": 40,
+    "target_training_band_fraction": 0.25,
+    "minimum_mode_support": 20,
+    "local_training_rows": 300,
+    "optimizer_maxiter": 60,
 }
 TARGET_DRIVEN_POLICY = {
     "seed": 20261011, "targets": (34.41, 129.30, 213.63),

@@ -12,14 +12,17 @@ import pickle
 import shutil
 import subprocess
 import warnings
+import time
 from datetime import datetime, timezone
 
 import numpy as np
 from scipy.optimize import minimize
+from scipy.spatial import cKDTree
+from scipy.linalg import solve_triangular
 from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.exceptions import ConvergenceWarning
 from threadpoolctl import threadpool_limits
@@ -37,6 +40,7 @@ from damping_policy import fixed_band_width_to_rx_ry
 GEOMETRY = tuple(k for k in REQUIRED_11D if k not in ("rx", "ry"))
 FEATURES = GEOMETRY + ("rx", "ry")
 POLICY = config.FREQUENCY9D_POLICY
+FIXED_BAND_TARGET_POLICY = config.FIXED_BAND_TARGET_GENERATION_POLICY
 MODELS = ("A_FIXED_9D_GPR", "B_CONDITIONAL_11D_GPR", "C_HIERARCHICAL_9_PLUS_2_GPR", "D_11D_EXTRATREES")
 BASE_OUTPUT = OUTPUT
 
@@ -53,7 +57,8 @@ def _fixed_band_training_data(dataset_csv):
             try:
                 parameters = {key: float(raw[key]) for key in FIXED_BAND_9D}
                 spectrum = [float(raw["f_mode_%02d_hz" % index]) for index in range(1, 25)]
-                if min(spectrum) <= 0.0:
+                if (not np.all(np.isfinite(list(parameters.values()) + spectrum)) or
+                        min(spectrum) <= 0.0 or np.any(np.diff(spectrum) < 0)):
                     continue
                 rows.append({"Sample_ID": raw["sample_id"], "Parameters": parameters,
                              "Spectrum_Hz": spectrum})
@@ -68,27 +73,594 @@ def _fixed_band_training_data(dataset_csv):
 
 class _FixedBandSpectrumGPR(object):
     """一个联合 24 输出 GPR；只用于固定 15 mm 样本库的实验性生成。"""
-    def fit(self, x, y):
+    def fit(self, x, y, max_iterations=None):
         self.input_scaler = StandardScaler().fit(x)
         # 每阶输出单独标准化，使高阶频率不会主导核参数拟合。
         self.output_scaler = StandardScaler().fit(y)
         kernel = ConstantKernel(1.0, (1.0e-2, 1.0e2)) * Matern(
             length_scale=np.ones(x.shape[1]), length_scale_bounds=(1.0e-2, 1.0e3), nu=2.5
         ) + WhiteKernel(1.0e-5, (1.0e-8, 1.0e-2))
+        options = {}
+        if max_iterations is not None:
+            # 仅实验模型使用显式训练预算；原生产模型的优化设置保持不变。
+            def bounded_optimizer(objective, initial, bounds):
+                result = minimize(objective, initial, jac=True, bounds=bounds,
+                                  method="L-BFGS-B", options={"maxiter": max_iterations})
+                self.optimizer_result = {"Success": bool(result.success),
+                                         "Message": str(result.message), "Iterations": int(result.nit)}
+                return result.x, result.fun
+            options["optimizer"] = bounded_optimizer
         self.model = GaussianProcessRegressor(
             kernel=kernel, alpha=1.0e-8, normalize_y=False, n_restarts_optimizer=1,
             random_state=20261013,
+            **options,
         ).fit(self.input_scaler.transform(x), self.output_scaler.transform(y))
+        # 局部函数不能写入缓存；预测不依赖优化器。
+        if max_iterations is not None:
+            self.model.optimizer = None
         return self
 
     def predict(self, x):
         mean_scaled, std_scaled = self.model.predict(self.input_scaler.transform(np.atleast_2d(x)), return_std=True)
+        # sklearn 单输出会压缩成一维，统一为 [样本, 模态]。
+        mean_scaled = np.asarray(mean_scaled).reshape(len(np.atleast_2d(x)), -1)
         mean = self.output_scaler.inverse_transform(mean_scaled)
         std_scaled = np.asarray(std_scaled)
         if std_scaled.ndim == 1:
             std_scaled = np.tile(std_scaled[:, None], (1, mean.shape[1]))
         std = std_scaled * self.output_scaler.scale_
         return mean, std
+
+
+class _FixedBandAnchorDelta(object):
+    """真实锚点频率 + GPR预测增量；只使用训练集锚点，不进行模态身份假设。"""
+
+    def __init__(self, baseline, x, y, sample_ids):
+        self.baseline = baseline
+        self.x, self.y = np.asarray(x), np.asarray(y)
+        self.sample_ids = list(sample_ids)
+        self.span = np.maximum(np.ptp(self.x, axis=0), 1.0e-12)
+        self.tree = cKDTree(self.x / self.span)
+        self.anchor_mean = baseline.predict(self.x)[0]
+        self.scaled_x = baseline.input_scaler.transform(self.x)
+        # 当前正式核为 Constant*Matern + WhiteKernel。这里只计算增量的潜在协方差，
+        # 不把WhiteKernel噪声重复加在两个端点上；仍必须由独立校准残差修正。
+        kernel = baseline.model.kernel_
+        if not isinstance(kernel.k2, WhiteKernel):
+            raise RuntimeError("UNSUPPORTED_ANCHOR_DELTA_KERNEL")
+        self.signal = kernel.k1
+        self.cross = self.signal(self.scaled_x, baseline.model.X_train_)
+
+    def anchors(self, x):
+        return self.tree.query(np.atleast_2d(x) / self.span)
+
+    def predict(self, x):
+        vectors = np.atleast_2d(x)
+        _, anchor = self.anchors(vectors)
+        raw_mean = self.baseline.predict(vectors)[0]
+        mean = self.y[anchor] + raw_mean - self.anchor_mean[anchor]
+        scaled = self.baseline.input_scaler.transform(vectors)
+        variances = []
+        # 分块避免为大量候选构造整个成对协方差矩阵。
+        for start in range(0, len(vectors), 128):
+            q = scaled[start:start + 128]
+            a = self.scaled_x[anchor[start:start + 128]]
+            difference = self.signal(q, self.baseline.model.X_train_) - self.cross[anchor[start:start + 128]]
+            solved = solve_triangular(self.baseline.model.L_, difference.T, lower=True, check_finite=False)
+            prior = self.signal.diag(q) + self.signal.diag(a) - 2 * np.diag(self.signal(q, a))
+            variance = prior - np.sum(solved * solved, axis=0)
+            if np.any(variance < -1.0e-6):
+                raise RuntimeError("INVALID_INCREMENT_COVARIANCE")
+            variances.extend(np.maximum(variance, 0))
+        scale = np.sqrt(np.asarray(variances))[:, None] * self.baseline.output_scaler.scale_[None, :]
+        # scale是待校准的增量尺度，不宣称它已经是实际频率误差的标准差。
+        return mean, np.maximum(scale, 1.0e-9)
+
+
+def _fixed_band_geometry_groups(x, radius):
+    """用九维归一化距离的连通分量分组，近重复点不能跨数据分区。"""
+    span = np.maximum(np.ptp(x, axis=0), 1.0e-12)
+    parent = np.arange(len(x))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for a, b in cKDTree((x - x.min(axis=0)) / span).query_pairs(radius):
+        parent[root(a)] = root(b)
+    return np.array([root(i) for i in range(len(x))])
+
+
+def _fixed_band_calibration_factor(actual, mean, std, coverage, minimum):
+    """仅用独立校准集的同排序阶次残差校准；不把它当作物理模态追踪。"""
+    scores = np.abs(actual - mean) / np.maximum(std, 1.0e-9)
+    if len(scores) < minimum or not np.all(np.isfinite(scores)):
+        raise RuntimeError("INSUFFICIENT_OR_INVALID_CALIBRATION_DATA")
+    order = int(math.ceil((len(scores) + 1) * coverage))
+    if order > len(scores):
+        raise RuntimeError("INSUFFICIENT_CALIBRATION_FOR_REQUESTED_COVERAGE")
+    return float(np.sort(scores)[order - 1])
+
+
+def _fixed_band_fit_cached(directory, name, x, y, policy):
+    """缓存仅属于当前数据哈希/分组/实验策略，不写正式模型缓存。"""
+    path = os.path.join(directory, name + ".pkl")
+    if os.path.isfile(path):
+        with open(path, "rb") as stream:
+            return pickle.load(stream)
+    print("MODEL_CHECK_TRAINING " + name, flush=True)
+    start = time.perf_counter()
+    with warnings.catch_warnings(record=True) as captured, threadpool_limits(limits=1):
+        warnings.simplefilter("always", ConvergenceWarning)
+        model = _FixedBandSpectrumGPR().fit(x, y, policy["optimizer_maxiter"])
+    payload = {"model": model, "seconds": time.perf_counter() - start,
+               "warnings": sorted(set(str(w.message) for w in captured)),
+               "kernel": str(model.model.kernel_)}
+    with open(path + ".pending", "wb") as stream:
+        pickle.dump(payload, stream)
+    os.replace(path + ".pending", path)
+    return payload
+
+
+def _fixed_band_selected_prediction(mean, std, target):
+    # 只按预测值选模态，绝不根据测试集真实频率选择预测阶次。
+    selected = np.argmin(np.abs(mean - target), axis=1)
+    row = np.arange(len(mean))
+    return selected, mean[row, selected], std[row, selected]
+
+
+def run_fixed_band_model_check(target, additional, dataset_csv):
+    """独立几何留出验证、校准和目标模型对照；此入口没有 FE 调用。"""
+    policy = dict(config.FIXED_BAND_MODEL_CHECK_POLICY)
+    targets = list(dict.fromkeys([float(target)] + [float(t) for t in additional]))
+    if not targets or any(not np.isfinite(t) or t <= 0 for t in targets):
+        raise ValueError("TARGET_FREQUENCIES_MUST_BE_FINITE_POSITIVE")
+    rows, x, y = _fixed_band_training_data(dataset_csv)
+    with open(dataset_csv, "rb") as stream:
+        dataset_hash = hashlib.sha256(stream.read()).hexdigest()
+    with open(__file__, "rb") as stream:
+        code_hash = hashlib.sha256(stream.read()).hexdigest()
+    identity = {"Dataset_SHA256": dataset_hash, "Code_SHA256": code_hash,
+                "Policy": policy, "Targets": targets}
+    token = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
+    output = ensure_directory(os.path.join(BASE_OUTPUT, "fixed_band_15mm", "model_check", token))
+    cache = ensure_directory(os.path.join(output, "experimental_cache"))
+    groups = _fixed_band_geometry_groups(x, policy["near_duplicate_radius"])
+    development, test = next(GroupShuffleSplit(n_splits=1, test_size=policy["test_fraction"],
+        random_state=policy["seed"]).split(x, groups=groups))
+    fit_rel, cal_rel = next(GroupShuffleSplit(n_splits=1,
+        test_size=policy["calibration_fraction_of_development"],
+        random_state=policy["seed"] + 1).split(x[development], groups=groups[development]))
+    fit, cal = development[fit_rel], development[cal_rel]
+    assert not (set(groups[fit]) & set(groups[cal]) or set(groups[fit]) & set(groups[test]) or
+                set(groups[cal]) & set(groups[test]))
+    split_rows = [{"Sample_ID": rows[i]["Sample_ID"], "Geometry_Group": int(groups[i]),
+                   "Partition": name} for name, indices in (("FIT", fit), ("CALIBRATION", cal),
+                                                            ("TEST", test)) for i in indices]
+    write_csv(os.path.join(output, "geometry_partitions.csv"), split_rows)
+    save_json(os.path.join(output, "run_manifest.json"), dict(identity, Status="RUNNING",
+        Rows=len(rows), Groups=len(set(groups)), Fit_Count=len(fit), Calibration_Count=len(cal),
+        Test_Count=len(test), Abaqus_Job_Submitted=False))
+    baseline = _fixed_band_fit_cached(cache, "shared_24_gpr", x[fit], y[fit], policy)
+    with threadpool_limits(limits=1):
+        base_cal = baseline["model"].predict(x[cal])
+        base_test = baseline["model"].predict(x[test])
+    existing_path = os.path.join(BASE_OUTPUT, "fixed_band_15mm", "generated",
+                                 "fixed_band_15mm_exploratory_candidates.csv")
+    existing = []
+    if os.path.isfile(existing_path):
+        with open(existing_path, encoding="utf-8-sig", newline="") as stream:
+            existing = list(csv.DictReader(stream))
+    benchmark, per_mode, reassessed, predictions, recommendations = [], [], [], [], []
+    training_details = [{"Model": "SHARED_24_GPR", "Seconds": baseline["seconds"],
+                         "Kernel": baseline["kernel"], "Warnings": baseline["warnings"]}]
+    for ft in targets:
+        support = np.sum(np.abs(y[fit] - ft) <= ft * policy["target_training_band_fraction"], axis=0)
+        modes = np.flatnonzero(support >= policy["minimum_mode_support"])
+        if not len(modes):
+            raise RuntimeError("NO_TRAINING_SUPPORTED_MODE_FOR_TARGET:%s" % ft)
+        local_models = []
+        local_seconds = 0.0
+        for mode in modes:
+            # 只用训练折的频率选目标相关样本，任何校准/测试频率均不可参与。
+            order = np.argsort(np.abs(y[fit, mode] - ft), kind="stable")
+            local = fit[order[:min(policy["local_training_rows"], len(fit))]]
+            label = "target_%s_mode_%02d" % (str(ft).replace(".", "p"), mode + 1)
+            payload = _fixed_band_fit_cached(cache, label, x[local], y[local, mode:mode + 1], policy)
+            local_models.append(payload["model"])
+            local_seconds += payload["seconds"]
+            training_details.append({"Model": label, "Train_Count": len(local),
+                "Seconds": payload["seconds"], "Kernel": payload["kernel"],
+                "Warnings": payload["warnings"]})
+
+        def local_predict(vectors):
+            with threadpool_limits(limits=1):
+                values = [model.predict(vectors) for model in local_models]
+            return (np.column_stack([v[0][:, 0] for v in values]),
+                    np.column_stack([v[1][:, 0] for v in values]))
+
+        method_scores = []
+        for name, indices, cp, tp, predictor, seconds in (
+                ("SHARED_24_GPR", np.arange(y.shape[1]), base_cal, base_test,
+                 baseline["model"].predict, baseline["seconds"]),
+                ("TARGET_LOCAL_PER_MODE_GPR", modes, local_predict(x[cal]), local_predict(x[test]),
+                 local_predict, local_seconds)):
+            cmode, cm, cs = _fixed_band_selected_prediction(*cp, ft)
+            q = _fixed_band_calibration_factor(y[cal, indices[cmode]], cm, cs,
+                                               policy["coverage"], policy["minimum_calibration_rows"])
+            tmode, tm, ts = _fixed_band_selected_prediction(*tp, ft)
+            truth = y[test, indices[tmode]]
+            absolute = np.abs(tm - truth)
+            relative = absolute / truth * 100
+            actual_detuning = np.abs(truth - ft) / ft * 100
+            upper = (np.abs(tm - ft) + q * ts) / ft * 100
+            row = {"Target_Frequency_Hz": ft, "Model": name, "Test_Count": len(test),
+                "Fit_Geometries": len(fit), "Calibration_Geometries": len(cal),
+                "Evaluated_Modes": ";".join(str(i + 1) for i in indices),
+                "Selected_Mode_MAPE_Percent": float(np.mean(relative)),
+                "Selected_Mode_MAE_Hz": float(np.mean(absolute)),
+                "Selected_Mode_P90_Percent": float(np.percentile(relative, 90)),
+                "Selected_Mode_Max_Error_Percent": float(np.max(relative)),
+                "Raw_95_Coverage_Percent": float(np.mean(absolute <= 1.96 * ts) * 100),
+                "Calibrated_95_Coverage_Percent": float(np.mean(absolute <= q * ts) * 100),
+                "Calibrated_Mean_Interval_Width_Hz": float(np.mean(2 * q * ts)),
+                "Calibration_Multiplier": q,
+                "Model_Screened_Test_Count": int(np.sum(upper <= 2)),
+                "Screened_Test_False_Accept_Count": int(np.sum((upper <= 2) & (actual_detuning > 2))),
+                "Selected_Mode_Target_Hit_Count": int(np.sum(actual_detuning <= 2)),
+                "Any_Observed_24_Mode_Target_Hit_Count": int(np.sum(np.min(np.abs(y[test] - ft), axis=1) / ft <= .02)),
+                "Predicted_Spectrum_Inversion_Percent": float(np.mean(np.any(np.diff(tp[0], axis=1) < 0, axis=1)) * 100),
+                "Training_Seconds": seconds, "Physical_Mode_Identity": "UNCONFIRMED",
+                "Protocol": "FIXED_GROUP_HOLDOUT_NOT_CROSS_VALIDATION"}
+            benchmark.append(row)
+            method_scores.append(row)
+            for column, mode in enumerate(indices):
+                err = np.abs(tp[0][:, column] - y[test, mode])
+                rel = err / y[test, mode] * 100
+                per_mode.append({"Target_Frequency_Hz": ft, "Model": name, "Mode": int(mode + 1),
+                    "Count": len(test), "MAPE_Percent": float(np.mean(rel)),
+                    "MAE_Hz": float(np.mean(err)), "P90_Percent": float(np.percentile(rel, 90))})
+            for k, i in enumerate(test):
+                predictions.append({"Target_Frequency_Hz": ft, "Model": name,
+                    "Sample_ID": rows[i]["Sample_ID"], "Selected_Sorted_Mode": int(indices[tmode[k]] + 1),
+                    "Predicted_Hz": float(tm[k]), "Actual_Same_Mode_Hz": float(truth[k]),
+                    "STD_Hz": float(ts[k]), "Calibrated_Radius_Hz": float(q * ts[k]),
+                    "Actual_Target_Detuning_Percent": float(actual_detuning[k])})
+            candidates = [c for c in existing if float(c["Target_Frequency_Hz"]) == ft]
+            if candidates:
+                vx = np.array([[float(c[key]) for key in FIXED_BAND_9D] for c in candidates])
+                with threadpool_limits(limits=1):
+                    pm, ps = predictor(vx)
+                selected, mean, std = _fixed_band_selected_prediction(pm, ps, ft)
+                for k, c in enumerate(candidates):
+                    bound = (abs(mean[k] - ft) + q * std[k]) / ft * 100
+                    reassessed.append({"Candidate_ID": c["Candidate_ID"], "Target_Frequency_Hz": ft,
+                        "Model": name, "Sorted_Mode": int(indices[selected[k]] + 1),
+                        "Predicted_Frequency_Hz": float(mean[k]), "STD_Hz": float(std[k]),
+                        "Calibrated_Radius_Hz": float(q * std[k]), "Upper_Error_Percent": float(bound),
+                        "Screen_Pass": bool(bound <= 2), "FE_Status": "NOT_RUN",
+                        "Evaluation_Status": "DEVELOPMENT_RECHECK_NOT_INDEPENDENT_TEST",
+                        "Original_Prediction_Preserved": True})
+        b, candidate = method_scores
+        recommended = (candidate["Selected_Mode_MAPE_Percent"] <= .9 * b["Selected_Mode_MAPE_Percent"] and
+                       candidate["Selected_Mode_P90_Percent"] <= b["Selected_Mode_P90_Percent"] and
+                       candidate["Calibrated_95_Coverage_Percent"] >= 90)
+        recommendations.append({"Target_Frequency_Hz": ft, "Decision":
+            "RECOMMENDED_EXPERIMENTAL_ONLY" if recommended else "KEEP_EXISTING_BASELINE",
+            "Production_Model_Replaced": False})
+        # 每个目标结束即保存，不必因中断重做已经完成的训练。
+        for filename, values in (("model_benchmark.csv", benchmark), ("per_mode_errors.csv", per_mode),
+                ("candidate_recheck.csv", reassessed), ("heldout_predictions.csv", predictions)):
+            write_csv(os.path.join(output, filename), values)
+        save_json(os.path.join(output, "training_details.json"), training_details)
+        print("MODEL_CHECK_TARGET_COMPLETED %s" % ft, flush=True)
+    report = ["# 固定15 mm反向设计模型检查", "",
+        "本次零Abaqus计算。原数据库、原候选、原验证结果与生产模型不覆盖。",
+        "", "## 数据与协议", "",
+        "有效几何 %d；近重复合并后 %d 组。训练 %d、校准 %d、测试 %d。" %
+        (len(rows), len(set(groups)), len(fit), len(cal), len(test)),
+        "固定种子分组留出，不是多折Group-CV。两模型使用相同测试几何。",
+        "共享24输出GPR和目标相关逐阶局部GPR均采用有限迭代预算；不能与历史全量拟合误差直接比较。",
+        "目标相关模型只依据训练集选择有支持的排序阶次和频率邻域；不使用测试频率选邻域。",
+        "超参数及标准化仅在训练子集拟合。校准集仅估计同阶残差/STD分位数；测试集只评价。",
+        "所报主误差为模型选择的最接近目标排序阶次的预测误差，不是任意阶命中率。",
+        "校准区间只针对该选阶规则的边际误差；不能保证优化器选出的新点有95%覆盖率。",
+        "物理模态身份未确认；无MAC证据。比较结果用于开发，不是最终独立认证。", "",
+        "## 实测对照", "",
+        "|目标Hz|模型|选阶MAPE %|P90 %|原区间覆盖 %|校准覆盖 %|校准平均宽度Hz|",
+        "|---|---|---:|---:|---:|---:|---:|"]
+    for r in benchmark:
+        report.append("|%g|%s|%.3f|%.3f|%.2f|%.2f|%.3f|" % (r["Target_Frequency_Hz"],
+            r["Model"], r["Selected_Mode_MAPE_Percent"], r["Selected_Mode_P90_Percent"],
+            r["Raw_95_Coverage_Percent"], r["Calibrated_95_Coverage_Percent"], r["Calibrated_Mean_Interval_Width_Hz"]))
+    report += ["", "## 结论与操作", ""]
+    report += ["- %g Hz：%s；生产模型不替换。" % (r["Target_Frequency_Hz"], r["Decision"]) for r in recommendations]
+    report += ["", "如果区间变宽但覆盖提高，说明原标准差低估误差，不应放宽2%真实验收门槛。",
+        "已有候选复核不等于新FE验证，也不是独立测试：它们曾由全数据库模型选择。",
+        "下次运行 `python main.py --design-mode MODEL_CHECK` 会按数据/代码哈希复用实验缓存。",
+        "普通 GENERATE 仍保留原模型；修正归一化搜索和优化器退出检查，不以预测命中冒充FE成功。",
+        "保留历史验证集；只有显式开发集才能在后续授权后用于修正，最终测试集必须另行冻结。",
+        "", "## 文件", ""]
+    report += ["- " + name for name in ("model_benchmark.csv", "per_mode_errors.csv", "candidate_recheck.csv",
+        "heldout_predictions.csv", "geometry_partitions.csv", "run_manifest.json", "training_details.json")]
+    report_path = os.path.join(output, "MODEL_CHECK_REPORT.md")
+    with open(report_path, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(report) + "\n")
+    result = dict(identity, Status="COMPLETED", Output_Directory=output, Report=report_path,
+        Recommendations=recommendations, Abaqus_Job_Submitted=False, Production_Model_Replaced=False)
+    save_json(os.path.join(output, "run_manifest.json"), dict(result, Rows=len(rows),
+        Groups=len(set(groups)), Fit_Count=len(fit), Calibration_Count=len(cal), Test_Count=len(test)))
+    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    return result
+
+
+def _fixed_band_load_checked_baseline(dataset_csv):
+    """复用已完成检查的训练模型与原分区，严格核对数据库及实际训练数组。"""
+    rows, x, y = _fixed_band_training_data(dataset_csv)
+    with open(dataset_csv, "rb") as stream:
+        digest = hashlib.sha256(stream.read()).hexdigest()
+    root = os.path.join(BASE_OUTPUT, "fixed_band_15mm", "model_check")
+    matches = []
+    if os.path.isdir(root):
+        for child in os.listdir(root):
+            directory = os.path.join(root, child)
+            manifest_path = os.path.join(directory, "run_manifest.json")
+            if not os.path.isfile(manifest_path):
+                continue
+            manifest = read_json(manifest_path)
+            if manifest.get("Status") == "COMPLETED" and manifest.get("Dataset_SHA256") == digest:
+                matches.append((os.path.getmtime(manifest_path), directory, manifest))
+    if not matches:
+        raise RuntimeError("RUN_MODEL_CHECK_FIRST_FOR_CURRENT_DATABASE")
+    _, source, manifest = max(matches)
+    by_id = {r["Sample_ID"]: i for i, r in enumerate(rows)}
+    if len(by_id) != len(rows):
+        raise RuntimeError("DUPLICATE_TRAINING_SAMPLE_IDS")
+    partitions = {name: [] for name in ("FIT", "CALIBRATION", "TEST")}
+    groups = {name: set() for name in partitions}
+    with open(os.path.join(source, "geometry_partitions.csv"), encoding="utf-8-sig", newline="") as stream:
+        for row in csv.DictReader(stream):
+            partitions[row["Partition"]].append(by_id[row["Sample_ID"]])
+            groups[row["Partition"]].add(row["Geometry_Group"])
+    flat = sum(partitions.values(), [])
+    if sorted(flat) != list(range(len(rows))) or any(not v for v in partitions.values()):
+        raise RuntimeError("INCOMPLETE_OR_DUPLICATE_PARTITIONS")
+    if (groups["FIT"] & groups["CALIBRATION"] or groups["FIT"] & groups["TEST"] or
+            groups["CALIBRATION"] & groups["TEST"]):
+        raise RuntimeError("GEOMETRY_PARTITION_LEAKAGE")
+    with open(os.path.join(source, "experimental_cache", "shared_24_gpr.pkl"), "rb") as stream:
+        payload = pickle.load(stream)
+    baseline = payload["model"]
+    fit = partitions["FIT"]
+    if (not np.allclose(baseline.input_scaler.inverse_transform(baseline.model.X_train_), x[fit],
+                        rtol=1.0e-10, atol=1.0e-12) or
+            not np.allclose(baseline.output_scaler.inverse_transform(baseline.model.y_train_), y[fit],
+                            rtol=1.0e-10, atol=1.0e-9)):
+        raise RuntimeError("CACHED_BASELINE_TRAINING_DATA_MISMATCH")
+    return rows, x, y, baseline, partitions, source, manifest
+
+
+def _fixed_band_anchor_metrics(name, target, cp, tp, y_cal, y_test, policy):
+    """同一选阶规则下评价原模型和增量模型；测试真实频率不参与选阶。"""
+    cmode, cm, cs = _fixed_band_selected_prediction(*cp, target)
+    q = _fixed_band_calibration_factor(y_cal[np.arange(len(y_cal)), cmode], cm, cs,
+                                       policy["coverage"], policy["minimum_calibration_rows"])
+    mode, mean, scale = _fixed_band_selected_prediction(*tp, target)
+    actual = y_test[np.arange(len(y_test)), mode]
+    error = np.abs(actual - mean)
+    relative = error / actual * 100
+    upper = (np.abs(mean - target) + q * scale) / target * 100
+    row = {"Target_Frequency_Hz": target, "Model": name, "Test_Count": len(y_test),
+        "Selected_Mode_MAPE_Percent": float(np.mean(relative)),
+        "Selected_Mode_MAE_Hz": float(np.mean(error)),
+        "Selected_Mode_P90_Percent": float(np.percentile(relative, 90)),
+        "Selected_Mode_Max_Error_Percent": float(np.max(relative)),
+        "Calibration_Multiplier": q,
+        "Calibrated_95_Coverage_Percent": float(np.mean(error <= q * scale) * 100),
+        "Calibrated_Mean_Interval_Width_Hz": float(np.mean(2 * q * scale)),
+        "Nominal_Screened_Test_Count": int(np.sum(upper <= 2)),
+        "False_Accept_Count": int(np.sum((upper <= 2) & (np.abs(actual - target) / target > .02))),
+        "Any_Actual_Mode_Target_Hit_Count": int(np.sum(np.min(np.abs(y_test - target), axis=1) / target <= .02)),
+        "Predicted_Spectrum_Inversion_Percent": float(np.mean(np.any(np.diff(tp[0], axis=1) < 0, axis=1)) * 100),
+        "Nonpositive_Prediction_Count": int(np.sum(tp[0] <= 0)),
+        "Physical_Mode_Identity": "UNCONFIRMED",
+        "Test_Role": "PREVIOUSLY_INSPECTED_DEVELOPMENT_HOLDOUT_NOT_NEW_BLIND_TEST"}
+    return row, mode, mean, scale, actual, upper
+
+
+def _fixed_band_local_validation_plan(candidates, targets, rows, x, dataset_hash):
+    """只冻结已有候选的下一轮少量验证清单，不生成DOE或调用求解器。"""
+    lookup = {r["Sample_ID"]: r for r in rows}
+    span = np.maximum(np.ptp(x, axis=0), 1.0e-12)
+    ledger = os.path.join(BASE_OUTPUT, "fixed_band_15mm", "generated", "fixed_band_15mm_abaqus_validation.csv")
+    used = set()
+    if os.path.isfile(ledger):
+        with open(ledger, encoding="utf-8-sig", newline="") as stream:
+            used = {r["Candidate_ID"] for r in csv.DictReader(stream)}
+    plan = []
+    for target in targets:
+        eligible = []
+        for c in candidates:
+            if float(c["Target_Frequency_Hz"]) != target or c["Candidate_ID"] in used:
+                continue
+            if any(abs(float(c.get(k, 0)) - .015) > 1.0e-12 for k in ("Damping_Inward_X_m", "Damping_Inward_Y_m")):
+                continue
+            anchor = lookup.get(c["Anchor_Sample_ID"])
+            if anchor is None:
+                continue
+            vector = np.array([float(c[k]) for k in FIXED_BAND_9D])
+            av = np.array([anchor["Parameters"][k] for k in FIXED_BAND_9D])
+            valid, _, _ = _fixed_band_geometry_valid(vector, x.min(axis=0), x.max(axis=0))
+            distance = float(np.linalg.norm((vector - av) / span))
+            nearest = float(np.min(np.linalg.norm((x - vector) / span, axis=1)))
+            if (valid and nearest >= FIXED_BAND_TARGET_POLICY["minimum_new_distance"] and
+                    distance <= FIXED_BAND_TARGET_POLICY["local_trust_radius"]):
+                eligible.append((distance, float(c["Predicted_STD_Hz"]) / target, c, anchor, vector))
+        eligible.sort(key=lambda item: (item[0], item[1], item[2]["Candidate_ID"]))
+        if not eligible:
+            continue
+        chosen = [eligible[0]]
+        # 第二个是预先锁定的复核点，优先与开发点保持几何差异，而非看未来FE结果选取。
+        if len(eligible) > 1:
+            chosen.append(max(eligible[1:], key=lambda item: np.linalg.norm((item[4] - chosen[0][4]) / span)))
+        for number, (distance, _, candidate, anchor, vector) in enumerate(chosen):
+            parameters = dict(zip(FIXED_BAND_9D, map(float, vector)))
+            record = {"Target_Frequency_Hz": target, "Candidate_ID": candidate["Candidate_ID"],
+                "Plan_Role": "DEVELOPMENT" if number == 0 else "LOCKED_FUTURE_CHECK",
+                "Source": "EXISTING_FROZEN_CANDIDATE_NO_NEW_DOE", "Dataset_SHA256": dataset_hash,
+                "Parameter_SHA256": hashlib.sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest(),
+                # 沿用现有单候选验证入口的字段名，未来无需转换这份清单。
+                "Prediction_Source": "ORIGINAL_FROZEN_GENERATION_NOT_ANCHOR_DELTA",
+                "Predicted_Frequency_Hz": float(candidate["Predicted_Frequency_Hz"]),
+                "Predicted_Mode_Index": int(candidate["Predicted_Mode_Index"]),
+                "Predicted_STD_Hz": float(candidate["Predicted_STD_Hz"]),
+                "Nearest_Training_Distance": float(np.min(np.linalg.norm((x - vector) / span, axis=1))),
+                "Anchor_Sample_ID": anchor["Sample_ID"], "Anchor_Distance": distance,
+                "Anchor_Mode": int(candidate["Anchor_Mode_Index"]),
+                "Anchor_Actual_Frequency_Hz": anchor["Spectrum_Hz"][int(candidate["Anchor_Mode_Index"]) - 1],
+                "Damping_Inward_X_m": .015, "Damping_Inward_Y_m": .015,
+                "Geometry_Precheck": "ALGEBRA_ONLY_PASS_NOT_MESH_OR_FE", "FE_Status": "NOT_SUBMITTED",
+                "Actual_Frequency_Hz": "", "Actual_Target_Error_Percent": "", "Requires_FE_Authorization": True}
+            record.update(parameters)
+            record.update({"Anchor_" + k: anchor["Parameters"][k] for k in FIXED_BAND_9D})
+            plan.append(record)
+    return plan
+
+
+def run_fixed_band_anchor_check(target, additional, dataset_csv):
+    """复用旧模型进行一次预先定义的锚点增量对照，不训练、不提交FE。"""
+    targets = list(dict.fromkeys([float(target)] + [float(t) for t in additional]))
+    if any(not np.isfinite(t) or t <= 0 for t in targets):
+        raise ValueError("TARGET_FREQUENCIES_MUST_BE_FINITE_POSITIVE")
+    rows, x, y, baseline, partitions, source, previous = _fixed_band_load_checked_baseline(dataset_csv)
+    fit, cal, test = [np.array(partitions[k]) for k in ("FIT", "CALIBRATION", "TEST")]
+    policy = previous["Policy"]
+    with open(__file__, "rb") as stream:
+        code_hash = hashlib.sha256(stream.read()).hexdigest()
+    candidate_path = os.path.join(BASE_OUTPUT, "fixed_band_15mm", "generated", "fixed_band_15mm_exploratory_candidates.csv")
+    ledger_path = os.path.join(BASE_OUTPUT, "fixed_band_15mm", "generated", "fixed_band_15mm_abaqus_validation.csv")
+    input_hashes = {}
+    for label, path in (("Existing_Candidate_SHA256", candidate_path), ("Validation_Ledger_SHA256", ledger_path)):
+        if os.path.isfile(path):
+            with open(path, "rb") as stream:
+                input_hashes[label] = hashlib.sha256(stream.read()).hexdigest()
+        else:
+            input_hashes[label] = None
+    identity = {"Dataset_SHA256": previous["Dataset_SHA256"], "Code_SHA256": code_hash,
+        "Source_Model_Check": source, "Targets": targets, "Method": "NEAREST_TRAINING_ANCHOR_GPR_INCREMENT",
+        "Anchor_Distance_Scaling": "TRAINING_FEATURE_RANGE_ONLY",
+        "Local_Trust_Radius": FIXED_BAND_TARGET_POLICY["local_trust_radius"]}
+    # 候选或台账改变时另建结果目录，禁止覆盖已经锁定的未来复核点。
+    identity.update(input_hashes)
+    token = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
+    output = ensure_directory(os.path.join(BASE_OUTPUT, "fixed_band_15mm", "anchor_delta", token))
+    save_json(os.path.join(output, "run_manifest.json"), dict(identity, Status="RUNNING", Abaqus_Job_Submitted=False))
+    start = time.perf_counter()
+    with threadpool_limits(limits=1):
+        corrected = _FixedBandAnchorDelta(baseline, x[fit], y[fit], [rows[i]["Sample_ID"] for i in fit])
+        original_cal, original_test = baseline.predict(x[cal]), baseline.predict(x[test])
+        delta_cal, delta_test = corrected.predict(x[cal]), corrected.predict(x[test])
+        anchor_error = float(np.max(np.abs(corrected.predict(x[fit[:20]])[0] - y[fit[:20]])))
+    if anchor_error > 1.0e-7:
+        raise RuntimeError("ANCHOR_INTERPOLATION_REGRESSION_FAILED")
+    cal_distance, _ = corrected.anchors(x[cal])
+    test_distance, test_anchor = corrected.anchors(x[test])
+    radius = identity["Local_Trust_Radius"]
+    local_cal = int(np.sum(cal_distance <= radius))
+    local_test = int(np.sum(test_distance <= radius))
+    # 没有近锚点真实验证对时，不把远距离校准外推成近距离设计的95%保证。
+    local_support = local_cal >= policy["minimum_calibration_rows"] and local_test >= policy["minimum_calibration_rows"]
+    benchmark, detail, reassessed, decisions = [], [], [], []
+    candidates = []
+    if os.path.isfile(candidate_path):
+        with open(candidate_path, encoding="utf-8-sig", newline="") as stream:
+            candidates = list(csv.DictReader(stream))
+    for ft in targets:
+        scores = []
+        for name, cp, tp, model in (("SHARED_24_GPR", original_cal, original_test, baseline),
+                                     ("ANCHOR_DELTA_GPR", delta_cal, delta_test, corrected)):
+            score, mode, mean, scale, actual, upper = _fixed_band_anchor_metrics(name, ft, cp, tp, y[cal], y[test], policy)
+            score.update(Local_Calibration_Count=local_cal, Local_Test_Count=local_test,
+                         Local_Calibration_Supported=local_support)
+            benchmark.append(score)
+            scores.append(score)
+            for k, i in enumerate(test):
+                detail.append({"Target_Frequency_Hz": ft, "Model": name, "Sample_ID": rows[i]["Sample_ID"],
+                    "Anchor_Sample_ID": rows[fit[test_anchor[k]]]["Sample_ID"],
+                    "Anchor_Distance": float(test_distance[k]), "Sorted_Mode": int(mode[k] + 1),
+                    "Predicted_Hz": float(mean[k]), "Actual_Same_Mode_Hz": float(actual[k]),
+                    "Same_Mode_Error_Percent": float(abs(mean[k] - actual[k]) / actual[k] * 100),
+                    "Calibrated_Radius_Hz": float(score["Calibration_Multiplier"] * scale[k]),
+                    "Nominal_Upper_Error_Percent": float(upper[k])})
+            subset = [c for c in candidates if float(c["Target_Frequency_Hz"]) == ft]
+            if subset:
+                vectors = np.array([[float(c[key]) for key in FIXED_BAND_9D] for c in subset])
+                with threadpool_limits(limits=1):
+                    cmode, cm, cs = _fixed_band_selected_prediction(*model.predict(vectors), ft)
+                distance, anchors = corrected.anchors(vectors)
+                for k, c in enumerate(subset):
+                    bound = (abs(cm[k] - ft) + score["Calibration_Multiplier"] * cs[k]) / ft * 100
+                    reassessed.append({"Candidate_ID": c["Candidate_ID"], "Target_Frequency_Hz": ft,
+                        "Model": name, "Anchor_Sample_ID": rows[fit[anchors[k]]]["Sample_ID"],
+                        "Anchor_Distance": float(distance[k]), "Sorted_Mode": int(cmode[k] + 1),
+                        "Predicted_Hz": float(cm[k]), "Nominal_Calibrated_Upper_Error_Percent": float(bound),
+                        "Nominal_Screen_Pass": bool(bound <= 2),
+                        "Local_Calibration_Supported": local_support,
+                        "Reliable_2Pct_Claim": False, "FE_Status": "NOT_RUN",
+                        "Status": "EXPERIMENTAL_RECHECK_NOT_FE_VALIDATED"})
+        b, d = scores
+        improved = (d["Selected_Mode_MAPE_Percent"] <= .9 * b["Selected_Mode_MAPE_Percent"] and
+                    d["Selected_Mode_P90_Percent"] <= b["Selected_Mode_P90_Percent"] and
+                    d["Calibrated_95_Coverage_Percent"] >= 90 and d["Nonpositive_Prediction_Count"] == 0)
+        decisions.append({"Target_Frequency_Hz": ft, "Meets_Predeclared_Improvement_Gate": improved,
+            "Decision": "EXPERIMENTAL_ONLY_REQUIRES_LOCAL_EVIDENCE" if improved else "KEEP_EXISTING_BASELINE",
+            "Production_Model_Replaced": False})
+    for filename, values in (("anchor_delta_benchmark.csv", benchmark),
+                             ("anchor_delta_heldout_predictions.csv", detail),
+                             ("anchor_delta_candidate_recheck.csv", reassessed)):
+        write_csv(os.path.join(output, filename), values)
+    plan = _fixed_band_local_validation_plan(candidates, targets, rows, x, previous["Dataset_SHA256"])
+    write_csv(os.path.join(output, "local_validation_priority.csv"), plan)
+    report = ["# 真实频率锚点与局部频率增量修正", "",
+        "公式：预测f(x) = 训练锚点实际f(a) + 原GPR预测f(x) - 原GPR预测f(a)。",
+        "锚点只按训练集九维几何距离选择，不读取校准/测试真实频率。24阶排序频率全部保留，不等同物理模态追踪。",
+        "增量协方差用于构造误差尺度，再用独立校准集残差校准；不将它直接称作可靠95%区间。", "",
+        "## 对照协议", "",
+        "复用上一轮%d/%d/%d训练、校准、测试几何及已训练GPR，无重新训练或FE。" % (len(fit), len(cal), len(test)),
+        "该测试集已在前轮查看，因此本轮是开发对照，不是新增盲测。没有用测试集拟合、选择锚点或校准区间。",
+        "预先规定实验改善门槛：MAPE至少降低10%、P90不恶化、校准覆盖至少90%、没有非正预测；不据此替换生产模型。",
+        "近锚点支持检查采用当前生成半径%.3f；校准集%d点、测试集%d点落在该范围。" % (radius, local_cal, local_test),
+        "锚点重构最大误差：%.6g Hz（前20个训练锚点数值回归，不是泛化精度）。" % anchor_error, "",
+        "## 实测结果", "", "|目标Hz|模型|MAPE %|P90 %|校准覆盖 %|平均区间宽度Hz|",
+        "|---|---|---:|---:|---:|---:|"]
+    for r in benchmark:
+        report.append("|%g|%s|%.3f|%.3f|%.2f|%.3f|" % (r["Target_Frequency_Hz"], r["Model"],
+            r["Selected_Mode_MAPE_Percent"], r["Selected_Mode_P90_Percent"],
+            r["Calibrated_95_Coverage_Percent"], r["Calibrated_Mean_Interval_Width_Hz"]))
+    report += ["", "## 决定", ""]
+    report += ["- %g Hz：%s。" % (r["Target_Frequency_Hz"], r["Decision"]) for r in decisions]
+    report += ["", "原生成模型、正式候选、FE台账保持不变；本轮不提交Abaqus。",
+        "若近锚点校准/测试不足，即使候选名义上通过2%区间筛选，也不允许声称可靠合格。",
+        "如果该方法没有稳定改善，应停止继续堆叠预测修正，转而准备少量具有独立对照的目标局部开发样本；需另行授权FE。",
+        "", "## 准备的最小验证清单", "",
+        "local_validation_priority.csv仅复用现有候选，冻结%d个构型；不新增DOE、不提交作业。" % len(plan),
+        "每个目标最多1个开发点和1个锁定复核点。先评估开发点，再决定是否授权复核；复核点不得用于拟合或选参数。",
+        "每行保存完整九维参数、固定15mm带宽、已有真实锚点参数和频率、原预测及参数哈希。真实新频率保持空白。",
+        "这批最多6次未来FE只是低成本局部诊断，不足以校准95%覆盖率或宣称全域达到2%；本轮FE次数为0。",
+        "", "运行：在项目目录执行 `python main.py --design-mode ANCHOR_CHECK`，建议使用Anaconda解释器。",
+        "", "输出：anchor_delta_benchmark.csv、anchor_delta_heldout_predictions.csv、anchor_delta_candidate_recheck.csv、local_validation_priority.csv、run_manifest.json。"]
+    path = os.path.join(output, "ANCHOR_DELTA_REPORT.md")
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(report) + "\n")
+    result = dict(identity, Status="COMPLETED", Elapsed_Seconds=time.perf_counter() - start,
+        Recommendations=decisions, Local_Calibration_Count=local_cal, Local_Test_Count=local_test,
+        Output_Directory=output, Report=path, Abaqus_Job_Submitted=False, New_GPR_Fits=0,
+        Production_Model_Replaced=False, Planned_Future_Validation_Count=len(plan))
+    save_json(os.path.join(output, "run_manifest.json"), result)
+    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    return result
 
 
 def _fixed_band_geometry_valid(vector, lower, upper):
@@ -109,52 +681,182 @@ def _fixed_band_geometry_valid(vector, lower, upper):
     return True, "OK", damping
 
 
-def _fixed_band_generate_for_target(target, model, train_x, lower, upper, count, seed):
-    """从多种训练邻域启动，针对任意排序阶中最接近目标者生成多解几何。"""
+def _fixed_band_generate_for_target(target, model, train_rows, train_x, train_y,
+                                    lower, upper, count, seed, excluded_ids=None):
+    """Generate only locally supported, database-external target candidates.
+
+    A global sorted-mode surrogate can report an artificial exact target while
+    being uncertain about the physical spectrum.  Generation therefore starts
+    from samples whose *actual Abaqus spectrum* already contains the target,
+    permits only a small normalised move, and rejects high-uncertainty output.
+    """
     rng = np.random.RandomState(seed)
     width = upper - lower
-    normalized_train = (train_x - lower) / width
-    train_mean, _ = model.predict(train_x)
-    anchors = []
-    for row, spectrum in enumerate(train_mean):
-        mode = int(np.argmin(np.abs(spectrum - target)))
-        anchors.append((abs(spectrum[mode] - target), row, mode))
-    anchors.sort()
-    proposals = []
-    for _, row, selected_mode in anchors[:min(80, len(anchors))]:
-        # 在已知局部附近启动，但不接受原数据库点本身。
-        start = np.clip(train_x[row] + rng.normal(0.0, 0.08, len(lower)) * width, lower, upper)
+    if np.any(width <= 0) or not np.all(np.isfinite(width)):
+        raise ValueError("DEGENERATE_GEOMETRY_SEARCH_RANGE")
+    rejections = []
+    excluded_ids = set(excluded_ids or ())
 
-        def objective(vector):
+    def reject(reason, anchor_row=None, anchor_mode=None, anchor_frequency=None,
+               anchor_detuning=None, **metrics):
+        row = {"Target_Frequency_Hz": float(target), "Rejection_Reason": reason,
+               "Anchor_Sample_ID": (train_rows[anchor_row]["Sample_ID"]
+                                    if anchor_row is not None else ""),
+               "Anchor_Mode_Index": (anchor_mode + 1 if anchor_mode is not None else ""),
+               "Anchor_Mode_Frequency_Hz": anchor_frequency if anchor_frequency is not None else "",
+               "Anchor_Detuning_Percent": anchor_detuning if anchor_detuning is not None else ""}
+        row.update(metrics)
+        rejections.append(row)
+
+    anchors = []
+    for row, spectrum in enumerate(train_y):
+        mode = int(np.argmin(np.abs(spectrum - target)))
+        detuning = float(abs(spectrum[mode] - target) / target * 100.0)
+        if detuning <= FIXED_BAND_TARGET_POLICY["anchor_detuning_percent"]:
+            anchors.append((detuning, row, mode))
+    anchors.sort()
+    if not anchors:
+        reject("NO_REAL_TARGET_ANCHOR_WITHIN_1_PERCENT")
+        return {"candidates": [], "rejections": rejections,
+                "diagnostic": {"Target_Frequency_Hz": float(target), "Anchor_Count": 0,
+                               "Optimization_Attempts": 0, "Valid_Proposals": 0,
+                               "Accepted_Candidates": 0}}
+    proposals = []
+    # 严格 UQ 门槛拒绝、但仍符合几何/可信域/预测频差条件的点，单独
+    # 保存为探索候选。它们不可被称为“设计成功”，只能由独立 Abaqus 判定。
+    exploratory = []
+    geometry_external_proposals = 0
+    radius = float(FIXED_BAND_TARGET_POLICY["local_trust_radius"])
+    minimum_new_distance = float(FIXED_BAND_TARGET_POLICY["minimum_new_distance"])
+    optimization_attempts = 0
+    for anchor_detuning, row, selected_mode in anchors[:min(80, len(anchors))]:
+        optimization_attempts += 1
+        anchor = train_x[row]
+        anchor_frequency = float(train_y[row, selected_mode])
+        # L-BFGS-B understands box constraints only.  Scaling each coordinate
+        # by sqrt(9) makes that box lie entirely inside the declared 9D
+        # Euclidean trust ball, so search and acceptance use the same rule.
+        coordinate_radius = radius / math.sqrt(len(lower))
+        local_lower = np.maximum(lower, anchor - coordinate_radius * width)
+        local_upper = np.minimum(upper, anchor + coordinate_radius * width)
+        # This is a genuinely new geometry, but remains within the local
+        # credibility neighbourhood of a real target-matching Abaqus sample.
+        start = np.clip(anchor + rng.normal(0.0, coordinate_radius / 2.0, len(lower)) * width,
+                        local_lower, local_upper)
+
+        def objective(normalized_vector):
+            # 优化器必须使用无量纲坐标，避免米级厚度与幂指数的步长失衡。
+            vector = lower + normalized_vector * width
             mean, std = model.predict(vector)
             error = abs(mean[0, selected_mode] - target) / target
-            distance = np.min(np.linalg.norm((vector - train_x) / width, axis=1))
-            # 只轻微惩罚过度外推；最终仍以真实 Abaqus 验证为准。
             uncertainty = std[0, selected_mode] / target
-            return error + 0.03 * uncertainty + max(0.0, 0.02 - distance) * 5.0
+            # Use an upper-confidence screen, not an exact-value objective.
+            return error + FIXED_BAND_TARGET_POLICY["upper_confidence_multiplier"] * uncertainty
 
-        result = minimize(objective, start, method="L-BFGS-B", bounds=list(zip(lower, upper)),
+        result = minimize(objective, (start - lower) / width, method="L-BFGS-B",
+                          bounds=list(zip((local_lower - lower) / width, (local_upper - lower) / width)),
                           options={"maxiter": 80, "ftol": 1.0e-10})
-        vector = result.x
+        if not result.success or not np.all(np.isfinite(result.x)):
+            reject("OPTIMIZER_NOT_CONVERGED", row, selected_mode, anchor_frequency,
+                   anchor_detuning, Optimizer_Message=str(result.message))
+            continue
+        vector = lower + result.x * width
         valid, reason, damping = _fixed_band_geometry_valid(vector, lower, upper)
         distance = float(np.min(np.linalg.norm((vector - train_x) / width, axis=1)))
-        if not valid or distance < 0.015 or distance > 0.35:
+        anchor_distance = float(np.linalg.norm((vector - anchor) / width))
+        if not valid:
+            reject("GEOMETRY_INVALID_" + reason, row, selected_mode, anchor_frequency,
+                   anchor_detuning, Nearest_Training_Distance=distance,
+                   Anchor_Distance=anchor_distance)
             continue
+        if distance < minimum_new_distance:
+            reject("NOT_DATABASE_EXTERNAL", row, selected_mode, anchor_frequency,
+                   anchor_detuning, Nearest_Training_Distance=distance,
+                   Anchor_Distance=anchor_distance)
+            continue
+        if anchor_distance > radius + 1.0e-10:
+            reject("OUTSIDE_LOCAL_TRUST_RADIUS", row, selected_mode, anchor_frequency,
+                   anchor_detuning, Nearest_Training_Distance=distance,
+                   Anchor_Distance=anchor_distance)
+            continue
+        geometry_external_proposals += 1
         mean, std = model.predict(vector)
         mode = int(np.argmin(np.abs(mean[0] - target)))
+        predicted_error = float(abs(mean[0, mode] - target) / target * 100.0)
+        predicted_std_percent = float(std[0, mode] / target * 100.0)
+        screened_upper = predicted_error + (
+            FIXED_BAND_TARGET_POLICY["upper_confidence_multiplier"] * predicted_std_percent)
+        reasons = []
+        if predicted_std_percent > FIXED_BAND_TARGET_POLICY["maximum_prediction_std_percent"]:
+            reasons.append("PREDICTED_STD_EXCEEDS_2_PERCENT")
+        if screened_upper > FIXED_BAND_TARGET_POLICY["match_percent"]:
+            reasons.append("UPPER_CONFIDENCE_ERROR_EXCEEDS_2_PERCENT")
+        if reasons:
+            if (predicted_error <= FIXED_BAND_TARGET_POLICY["match_percent"] and
+                    predicted_std_percent <= FIXED_BAND_TARGET_POLICY[
+                        "exploratory_max_prediction_std_percent"]):
+                proposal = dict(zip(FIXED_BAND_9D, [float(v) for v in vector]))
+                proposal.update({
+                    "Candidate_ID": "FB15EXP_" + hashlib.sha256(
+                        json.dumps(proposal, sort_keys=True).encode()).hexdigest()[:12],
+                    "Target_Frequency_Hz": float(target),
+                    "Predicted_Mode_Index": mode + 1,
+                    "Predicted_Frequency_Hz": float(mean[0, mode]),
+                    "Predicted_STD_Hz": float(std[0, mode]),
+                    "Predicted_Error_Percent": predicted_error,
+                    "Predicted_STD_Percent": predicted_std_percent,
+                    "Predicted_Upper_Confidence_Error_Percent": screened_upper,
+                    "Nearest_Training_Distance": distance,
+                    "Anchor_Distance": anchor_distance,
+                    "Anchor_Sample_ID": train_rows[row]["Sample_ID"],
+                    "Anchor_Mode_Index": selected_mode + 1,
+                    "Anchor_Mode_Frequency_Hz": float(train_y[row, selected_mode]),
+                    "Anchor_Detuning_Percent": anchor_detuning,
+                    "Local_Trust_Radius": radius, "Geometry_Valid": True,
+                    "New_Geometry": True, "Data_Library": FIXED_BAND_LIBRARY,
+                    "Damping_Inward_X_m": 0.015, "Damping_Inward_Y_m": 0.015,
+                    "rx_for_v2_builder": damping["rx"], "ry_for_v2_builder": damping["ry"],
+                    "Damping_Configuration": damping["Damping_Configuration"],
+                    "Prediction_Status": "EXPLORATORY_UQ_NOT_PASSED_REQUIRES_ABAQUS",
+                    "Uncertainty_Calibration_Status": "UNCALIBRATED_NOT_A_95_PERCENT_GUARANTEE",
+                    "Physical_Mode_Identity": "UNCONFIRMED",
+                    "Optimizer_Success": True,
+                    "Strict_Rejection_Reason": ";".join(reasons),
+                    "Predicted_Ordered_Frequencies_Hz": json.dumps(
+                        [float(value) for value in mean[0]]),
+                })
+                exploratory.append(proposal)
+            reject(";".join(reasons), row, selected_mode, anchor_frequency, anchor_detuning,
+                   Predicted_Mode_Index=mode + 1, Predicted_Frequency_Hz=float(mean[0, mode]),
+                   Predicted_Error_Percent=predicted_error,
+                   Predicted_STD_Percent=predicted_std_percent,
+                   Predicted_Upper_Confidence_Error_Percent=screened_upper,
+                   Nearest_Training_Distance=distance, Anchor_Distance=anchor_distance)
+            continue
         proposal = dict(zip(FIXED_BAND_9D, [float(v) for v in vector]))
         proposal.update({
             "Candidate_ID": "FB15_" + hashlib.sha256(json.dumps(proposal, sort_keys=True).encode()).hexdigest()[:12],
             "Target_Frequency_Hz": float(target), "Predicted_Mode_Index": mode + 1,
             "Predicted_Frequency_Hz": float(mean[0, mode]),
             "Predicted_STD_Hz": float(std[0, mode]),
-            "Predicted_Error_Percent": float(abs(mean[0, mode] - target) / target * 100.0),
-            "Nearest_Training_Distance": distance, "Geometry_Valid": True,
+            "Predicted_Error_Percent": predicted_error,
+            "Predicted_STD_Percent": predicted_std_percent,
+            "Predicted_Upper_Confidence_Error_Percent": screened_upper,
+            "Nearest_Training_Distance": distance,
+            "Anchor_Distance": anchor_distance,
+            "Anchor_Sample_ID": train_rows[row]["Sample_ID"],
+            "Anchor_Mode_Index": selected_mode + 1,
+            "Anchor_Mode_Frequency_Hz": float(train_y[row, selected_mode]),
+            "Anchor_Detuning_Percent": anchor_detuning,
+            "Local_Trust_Radius": radius, "Geometry_Valid": True,
             "New_Geometry": True, "Data_Library": FIXED_BAND_LIBRARY,
             "Damping_Inward_X_m": 0.015, "Damping_Inward_Y_m": 0.015,
             "rx_for_v2_builder": damping["rx"], "ry_for_v2_builder": damping["ry"],
             "Damping_Configuration": damping["Damping_Configuration"],
-            "Prediction_Status": "EXPLORATORY_REQUIRES_ABAQUS",
+            "Prediction_Status": "LOCAL_TRUST_REGION_SCREENED_REQUIRES_ABAQUS",
+            "Uncertainty_Calibration_Status": "UNCALIBRATED_NOT_A_95_PERCENT_GUARANTEE",
+            "Physical_Mode_Identity": "UNCONFIRMED",
+            "Optimizer_Success": True,
             "Predicted_Ordered_Frequencies_Hz": json.dumps([float(v) for v in mean[0]]),
         })
         proposals.append(proposal)
@@ -164,14 +866,62 @@ def _fixed_band_generate_for_target(target, model, train_x, lower, upper, count,
                                                           item["Predicted_STD_Hz"])):
         vector = np.array([candidate[key] for key in FIXED_BAND_9D])
         normal = (vector - lower) / width
-        if all(np.linalg.norm(normal - (np.array([old[key] for key in FIXED_BAND_9D]) - lower) / width) >= 0.08
+        if all(np.linalg.norm(normal - (np.array([old[key] for key in FIXED_BAND_9D]) - lower) / width) >=
+               FIXED_BAND_TARGET_POLICY["minimum_pair_distance"]
                for old in selected):
             selected.append(candidate)
+        else:
+            reject("PAIR_DIVERSITY_FILTER", train_rows.index(next(item for item in train_rows
+                   if item["Sample_ID"] == candidate["Anchor_Sample_ID"])),
+                   candidate["Anchor_Mode_Index"] - 1, candidate["Anchor_Mode_Frequency_Hz"],
+                   candidate["Anchor_Detuning_Percent"],
+                   Predicted_STD_Percent=candidate["Predicted_STD_Percent"],
+                   Predicted_Upper_Confidence_Error_Percent=candidate["Predicted_Upper_Confidence_Error_Percent"])
         if len(selected) >= count:
             break
     for index, candidate in enumerate(selected, 1):
         candidate["Generation_Priority"] = index
-    return selected
+    exploratory_selected = []
+    previously_validated_skipped = 0
+    for candidate in sorted(exploratory, key=lambda item: (
+            item["Predicted_STD_Percent"], item["Predicted_Error_Percent"],
+            item["Nearest_Training_Distance"])):
+        if candidate["Candidate_ID"] in excluded_ids:
+            previously_validated_skipped += 1
+            reject("ALREADY_IN_INDEPENDENT_VALIDATION_LEDGER")
+            continue
+        vector = np.array([candidate[key] for key in FIXED_BAND_9D])
+        normal = (vector - lower) / width
+        if all(np.linalg.norm(normal - (
+                np.array([old[key] for key in FIXED_BAND_9D]) - lower) / width) >=
+               FIXED_BAND_TARGET_POLICY["minimum_pair_distance"]
+               for old in exploratory_selected):
+            exploratory_selected.append(candidate)
+        if len(exploratory_selected) >= FIXED_BAND_TARGET_POLICY[
+                "exploratory_candidate_count"]:
+            break
+    for index, candidate in enumerate(exploratory_selected, 1):
+        candidate["Exploratory_Priority"] = index
+    return {"candidates": selected, "exploratory_candidates": exploratory_selected,
+            "rejections": rejections,
+            "diagnostic": {"Target_Frequency_Hz": float(target), "Anchor_Count": len(anchors),
+                           "Optimization_Attempts": optimization_attempts,
+                           "Geometry_External_Proposals": geometry_external_proposals,
+                           "UQ_Passed_Proposals": len(proposals),
+                           "Exploratory_Candidates": len(exploratory_selected),
+                           "Previously_Validated_Candidates_Skipped": previously_validated_skipped,
+                           "Accepted_Candidates": len(selected)}}
+
+
+def _fixed_band_validated_candidate_ids(output_dir):
+    """Return candidate IDs with a completed solver record; never re-propose them."""
+    path = os.path.join(output_dir, "fixed_band_15mm_abaqus_validation.csv")
+    if not os.path.isfile(path):
+        return set()
+    with open(path, newline="", encoding="utf-8-sig") as stream:
+        return {str(row.get("Candidate_ID", "")).strip() for row in csv.DictReader(stream)
+                if str(row.get("Candidate_ID", "")).strip() and
+                str(row.get("Status", "")).strip() == "SUCCESS"}
 
 
 def run_fixed_band_frequency_generation(mode, target, additional, dataset_csv):
@@ -184,16 +934,53 @@ def run_fixed_band_frequency_generation(mode, target, additional, dataset_csv):
     with threadpool_limits(limits=1):
         model = _FixedBandSpectrumGPR().fit(x, y)
     output = ensure_directory(os.path.join(BASE_OUTPUT, "fixed_band_15mm", "generated"))
-    candidates = []
+    validated_ids = _fixed_band_validated_candidate_ids(output)
+    candidates, exploratory_candidates, rejections, diagnostics = [], [], [], []
     for index, target_value in enumerate(targets):
-        candidates.extend(_fixed_band_generate_for_target(
-            target_value, model, x, lower, upper, count=8, seed=20261013 + index))
+        generated = _fixed_band_generate_for_target(
+            target_value, model, rows, x, y, lower, upper,
+            count=FIXED_BAND_TARGET_POLICY["candidate_count"], seed=20261013 + index,
+            excluded_ids=validated_ids)
+        candidates.extend(generated["candidates"])
+        exploratory_candidates.extend(generated.get("exploratory_candidates", []))
+        rejections.extend(generated["rejections"])
+        diagnostics.append(generated["diagnostic"])
     write_csv(os.path.join(output, "fixed_band_15mm_new_abh_candidates.csv"), candidates)
+    exploratory_path = os.path.join(output, "fixed_band_15mm_exploratory_candidates.csv")
+    write_csv(exploratory_path, exploratory_candidates)
+    rejection_path = os.path.join(output, "fixed_band_15mm_generation_rejections.csv")
+    write_csv(rejection_path, rejections)
+    rejection_summary = []
+    for target_value in targets:
+        target_rows = [row for row in rejections if row["Target_Frequency_Hz"] == float(target_value)]
+        counts = {}
+        for row in target_rows:
+            reason = row["Rejection_Reason"]
+            counts[reason] = counts.get(reason, 0) + 1
+        for reason, count_value in sorted(counts.items()):
+            rejection_summary.append({"Target_Frequency_Hz": float(target_value),
+                                      "Rejection_Reason": reason,
+                                      "Rejected_Attempts": count_value})
+    rejection_summary_path = os.path.join(output, "fixed_band_15mm_generation_rejection_summary.csv")
+    write_csv(rejection_summary_path, rejection_summary)
     summary = {
-        "Status": "GENERATED_NOT_ABAQUS_VALIDATED", "Abaqus_Job_Submitted": False,
+        # 空候选是可信域/UQ筛选的正常结果，不能伪装成已经生成但尚未验证。
+        "Status": ("GENERATED_NOT_ABAQUS_VALIDATED" if candidates else
+                   ("EXPLORATORY_CANDIDATES_REQUIRE_ABAQUS_VALIDATION"
+                    if exploratory_candidates else
+                    "NO_CANDIDATES_PASSED_LOCAL_UQ_GATE")),
+        "Abaqus_Job_Submitted": False,
         "Data_Library": FIXED_BAND_LIBRARY, "Training_Geometries": len(rows),
         "Target_Frequencies_Hz": targets, "Generated_Candidates": len(candidates),
+        "Exploratory_Candidates": len(exploratory_candidates),
+        "Previously_Validated_Candidate_IDs_Excluded": len(validated_ids),
+        "Generation_Method": "LOCAL_TARGET_MATCHING_ANCHOR_PLUS_UQ_HARD_GATE",
+        "Generation_Policy": FIXED_BAND_TARGET_POLICY,
+        "Target_Diagnostics": diagnostics,
         "Output": os.path.join(output, "fixed_band_15mm_new_abh_candidates.csv"),
+        "Exploratory_Output": exploratory_path,
+        "Rejection_Output": rejection_path,
+        "Rejection_Summary_Output": rejection_summary_path,
     }
     save_json(os.path.join(output, "fixed_band_15mm_generation_summary.json"), summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
@@ -572,6 +1359,30 @@ def summarize_validation(candidate, result):
     return row
 
 
+def rebuild_fixed_band_validation_ledger():
+    """Rebuild the fixed-band validation table from per-candidate checkpoints.
+
+    A single validation has its own checkpoint.  The durable ledger must merge
+    those checkpoints rather than allowing one single-candidate write to
+    replace another candidate's result.  This performs no Abaqus work.
+    """
+    output_dir = ensure_directory(os.path.join(
+        BASE_OUTPUT, "fixed_band_15mm", "generated"))
+    state_root = os.path.join(RUNS, "fixed_band_15mm_validation", "_state")
+    records = {}
+    if os.path.isdir(state_root):
+        for name in os.listdir(state_root):
+            checkpoint = os.path.join(state_root, name, "checkpoint.json")
+            state = read_json(checkpoint)
+            if not state:
+                continue
+            for candidate_id, record in state.get("Validation", {}).items():
+                records[candidate_id] = record
+    path = os.path.join(output_dir, "fixed_band_15mm_abaqus_validation.csv")
+    write_csv(path, [records[key] for key in sorted(records)])
+    return path, len(records)
+
+
 def validate_saved_candidate(candidate_id, candidate_csv=None):
     """只验证一个已生成的新构型；不会重新训练或生成其它候选。"""
     global OUTPUT
@@ -659,8 +1470,16 @@ def validate_fixed_band_saved_candidate(candidate_id, candidate_csv=None):
     """
     output_dir = ensure_directory(os.path.join(
         BASE_OUTPUT, "fixed_band_15mm", "generated"))
-    candidate_csv = candidate_csv or os.path.join(
-        output_dir, "fixed_band_15mm_new_abh_candidates.csv")
+    if candidate_csv:
+        candidate_csv = candidate_csv
+    elif str(candidate_id).startswith("FB15EXP_"):
+        # 探索候选与严格候选分表保存；只凭 ID 即可选择正确来源，避免用户
+        # 因填写错 CSV 而误以为候选不存在。
+        candidate_csv = os.path.join(
+            output_dir, "fixed_band_15mm_exploratory_candidates.csv")
+    else:
+        candidate_csv = os.path.join(
+            output_dir, "fixed_band_15mm_new_abh_candidates.csv")
     if not os.path.isfile(candidate_csv):
         raise RuntimeError("FIXED_BAND_CANDIDATE_CSV_NOT_FOUND: " + candidate_csv)
 
@@ -747,19 +1566,106 @@ def validate_fixed_band_saved_candidate(candidate_id, candidate_csv=None):
                        "Validation_Model": "FIXED_BAND_15MM"})
         state.setdefault("Validation", {})[candidate_id] = record
         save_json(checkpoint, state)
-        rows = []
-        if os.path.isfile(validation_csv):
-            with open(validation_csv, newline="", encoding="utf-8-sig") as stream:
-                rows = [row for row in csv.DictReader(stream)
-                        if str(row.get("Candidate_ID", "")).strip() != candidate_id]
-        rows.append(record)
-        write_csv(validation_csv, rows)
+        # Rebuild from all one-candidate checkpoints so an individual run
+        # cannot overwrite an earlier validation result.
+        validation_csv, _ = rebuild_fixed_band_validation_ledger()
 
     submitted = bool(state.get("Jobs", {}).get(candidate_id, {}).get("PID"))
     result = dict(record, Abaqus_Job_Submitted=submitted,
                   Validation_CSV=validation_csv)
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     return result
+
+
+def validate_fixed_band_saved_candidates_batch(candidate_ids, candidate_csv=None,
+                                                retry_previously_attempted=False):
+    """按用户明确给出的顺序，逐个验证固定 15 mm 阻尼带候选。
+
+    本函数不生成候选、不训练模型。每次调用底层单候选验证入口，因此保持既有
+    V2 几何、材料、网格和 Abaqus 提交流程不变。完成一个候选后立即保存批次
+    台账；中断后再次运行会根据正式验证台账跳过已经成功或已尝试的 ID。
+    """
+    ids = [str(item).strip() for item in candidate_ids if str(item).strip()]
+    if not ids:
+        raise RuntimeError("BATCH_CANDIDATE_IDS_REQUIRED")
+    duplicates = sorted({item for item in ids if ids.count(item) > 1})
+    if duplicates:
+        raise RuntimeError("BATCH_CANDIDATE_IDS_NOT_UNIQUE:" + ",".join(duplicates))
+
+    output_dir = ensure_directory(os.path.join(
+        BASE_OUTPUT, "fixed_band_15mm", "generated"))
+    if candidate_csv:
+        source_csv = candidate_csv
+    else:
+        source_csv = os.path.join(output_dir, "fixed_band_15mm_exploratory_candidates.csv")
+    if not os.path.isfile(source_csv):
+        raise RuntimeError("FIXED_BAND_BATCH_CANDIDATE_CSV_NOT_FOUND:" + source_csv)
+
+    with open(source_csv, newline="", encoding="utf-8-sig") as stream:
+        source_rows = list(csv.DictReader(stream))
+    source_ids = [str(row.get("Candidate_ID", "")).strip() for row in source_rows]
+    missing = [item for item in ids if source_ids.count(item) != 1]
+    if missing:
+        raise RuntimeError("BATCH_CANDIDATE_ID_NOT_FOUND_OR_NOT_UNIQUE:" + ",".join(missing))
+
+    ledger_path = os.path.join(output_dir, "fixed_band_15mm_abaqus_validation.csv")
+    existing = {}
+    if os.path.isfile(ledger_path):
+        with open(ledger_path, newline="", encoding="utf-8-sig") as stream:
+            for row in csv.DictReader(stream):
+                item = str(row.get("Candidate_ID", "")).strip()
+                if item:
+                    existing[item] = dict(row)
+
+    batch_csv = os.path.join(output_dir, "fixed_band_15mm_batch_validation_summary.csv")
+    checkpoint_path = os.path.join(output_dir, "fixed_band_15mm_batch_validation_checkpoint.json")
+    checkpoint = read_json(checkpoint_path) or {}
+    checkpoint.update({
+        "Status": "RUNNING", "Candidate_CSV": os.path.abspath(source_csv),
+        "Candidate_IDs": ids, "Retry_Previously_Attempted": bool(retry_previously_attempted),
+        "Started_UTC": checkpoint.get("Started_UTC", datetime.now(timezone.utc).isoformat()),
+    })
+    records = []
+
+    for sequence, candidate_id in enumerate(ids, 1):
+        prior = existing.get(candidate_id)
+        if prior and prior.get("Status") == "SUCCESS":
+            result = dict(prior, Status="ALREADY_VALIDATED_NO_RESUBMIT",
+                          Abaqus_Job_Submitted=False)
+            action = "SKIPPED_SUCCESS_ALREADY_RECORDED"
+        elif prior and not retry_previously_attempted:
+            result = dict(prior, Abaqus_Job_Submitted=False)
+            action = "SKIPPED_PREVIOUSLY_ATTEMPTED"
+        else:
+            action = "SUBMITTED_SEQUENTIALLY"
+            try:
+                result = validate_fixed_band_saved_candidate(candidate_id, source_csv)
+            except Exception as exc:
+                # 保留当前批次其它候选继续执行；错误写入批次台账供人工排查。
+                result = {"Candidate_ID": candidate_id, "Status": "BATCH_ENTRY_ERROR",
+                          "Error": str(exc), "Abaqus_Job_Submitted": False}
+                action = "NOT_SUBMITTED_ENTRY_ERROR"
+
+        row = dict(result)
+        row.update({"Batch_Sequence": sequence, "Batch_Action": action,
+                    "Batch_Candidate_CSV": os.path.abspath(source_csv),
+                    "Retry_Previously_Attempted": bool(retry_previously_attempted)})
+        records.append(row)
+        checkpoint.update({"Completed_Count": len(records), "Last_Candidate_ID": candidate_id,
+                           "Last_Status": row.get("Status", "UNKNOWN"), "Records": records})
+        save_json(checkpoint_path, checkpoint)
+        write_csv(batch_csv, records)
+
+    submitted = sum(bool(row.get("Abaqus_Job_Submitted")) for row in records)
+    checkpoint.update({"Status": "COMPLETED", "Completed_UTC": datetime.now(timezone.utc).isoformat(),
+                       "Abaqus_Jobs_Submitted": submitted})
+    save_json(checkpoint_path, checkpoint)
+    payload = {"Status": "BATCH_VALIDATION_COMPLETED", "Requested_Candidates": len(ids),
+               "Abaqus_Jobs_Submitted": submitted, "Batch_Summary_CSV": batch_csv,
+               "Checkpoint": checkpoint_path, "Validation_Ledger": ledger_path,
+               "Sequential": True}
+    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return payload
 
 
 def write_report(state, data, comparison, candidates):
@@ -773,7 +1679,7 @@ def write_report(state, data, comparison, candidates):
     lines += ["旧任务没有完成局部新候选优化；未完成动态结果不作为本阶段训练标签。",
               "", "## 2. 固定阻尼与数据",
               "D02：rx=%.15g，ry=%.15g；15组基础几何均有相同参数，位于既有范围中部。D04并非共同固定构形。"%tuple(data["ref"]),
-              "保留 V2 材料、3 mm阻尼层、约束层及独立夹持边界定义。145 MPa仍是未经实验交叉验证的等效仿真参数。",
+              "保留 V2 几何、3 mm阻尼层、约束层及独立夹持边界定义；材料参数以当前 config 的 ABH_Frequency_Dataset_V2_2 对齐值为准。",
               "数据库：%d个样本、%d组几何、%d条模态。以几何坐标哈希分组，整组阻尼方案只进入同一折。"%(len(data["ids"]),len(set(data["groups"])),data["mode_rows"]),
               "预测前8个排序固有频率（全部79样本完整）；其余605条高阶模态仅用于数据库参照，因500 Hz截断造成样本不齐，不混入完整谱训练。",
               "排序编号不是固定物理模态；未声称解决mode veering/crossing。新算例同时报告同排序模态误差与全部模态最近目标误差。",

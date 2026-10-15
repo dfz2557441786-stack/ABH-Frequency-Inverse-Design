@@ -24,7 +24,7 @@ def _load_two_axis_mesh_shell_module(mesh_level, thickness_implementation):
     return namespace["create_shell"]
 
 
-def run_frame(parameters, run_directory, job_name, split_xy=False, mesh_level=None, mode_count=8, material_overrides=None, field_implementation=None, dataset_source="", submit_job=True, resource_policy=None):
+def run_frame(parameters, run_directory, job_name, split_xy=False, mesh_level=None, mode_count=8, material_overrides=None, field_implementation=None, dataset_source="", submit_job=True, resource_policy=None, save_cae_path=None, minimum_required_modes=None):
     field_implementation = field_implementation or config.THICKNESS_FIELD_IMPLEMENTATION
     ok, reason, derived = validate_frame(parameters)
     if not ok: raise ValueError(reason)
@@ -68,13 +68,25 @@ def run_frame(parameters, run_directory, job_name, split_xy=False, mesh_level=No
             tie_area=0.0
         damp_elastic=model.materials["Damp_Material"].elastic.table[0][0]
         constrained_elastic=model.materials["Constrained_Layer_Material"].elastic.table[0][0]
-        checks={"Material_Valid": abs(damp_elastic-args["damp_elastic"])/args["damp_elastic"]<1.0e-12 and abs(constrained_elastic-args["constrained_elastic"])/args["constrained_elastic"]<1.0e-12,
+        al_density=model.materials["Al"].density.table[0][0]
+        al_elastic, al_poisson=model.materials["Al"].elastic.table[0]
+        al_policy=config.FIXED_ALUMINUM_PARAMETERS
+        checks={"Material_Valid": abs(damp_elastic-args["damp_elastic"])/args["damp_elastic"]<1.0e-12 and abs(constrained_elastic-args["constrained_elastic"])/args["constrained_elastic"]<1.0e-12 and abs(al_density-al_policy["density"])/al_policy["density"]<1.0e-12 and abs(al_elastic-al_policy["elastic"])/al_policy["elastic"]<1.0e-12 and abs(al_poisson-al_policy["poisson"])<1.0e-12,
                 "Section_Valid": set(section_names)==set(["Damp","Constrained"]),
                 "Tie_Valid": "Constraint-1" in model.constraints and len(slave_faces)>0 and tie_area>0.0,
                 "BC_Valid": "BC-1" in model.boundaryConditions,
                 "Mesh_Valid": len(damp_part.elements)>0 and len(model.parts["ABH_Shell"].elements)>0}
         if not all(checks.values()): raise RuntimeError("Model checks failed: {0}".format(checks))
         if not submit_job:
+            # Build-only callers still need a real INP/CAE artifact for visual
+            # comparison; writing input never submits an Abaqus analysis.
+            mdb.jobs[job_name].writeInput(consistencyChecking=False)
+            cae_path = ""
+            if save_cae_path:
+                cae_path = os.path.splitext(os.path.abspath(save_cae_path))[0] + ".cae"
+                if os.path.exists(cae_path):
+                    raise RuntimeError("COMPARISON_CAE_ALREADY_EXISTS:%s" % cae_path)
+                mdb.saveAs(pathName=os.path.splitext(cae_path)[0])
             inp=os.path.join(run_directory,job_name+".inp")
             if not os.path.isfile(inp) or os.path.getsize(inp)==0:
                 raise RuntimeError("BUILD_ONLY_INP_MISSING")
@@ -82,6 +94,16 @@ def run_frame(parameters, run_directory, job_name, split_xy=False, mesh_level=No
                         INP_Path=inp, Frequency_Upper_Limit_Hz=float(model.steps["Step-1"].maxEigen),
                         Element_Count=sum(len(i.elements) for i in model.rootAssembly.instances.values()),
                         Node_Count=sum(len(i.nodes) for i in model.rootAssembly.instances.values()),
+                        CAE_Path=cae_path,
+                        Al_Density=al_density, Al_Elastic=al_elastic, Al_Poisson=al_poisson,
+                        Damp_Density=model.materials["Damp_Material"].density.table[0][0],
+                        Damp_Elastic=damp_elastic,
+                        Damp_Poisson=model.materials["Damp_Material"].elastic.table[0][1],
+                        Damp_Loss_Factor=model.materials["Damp_Material"].damping.structural,
+                        Constrained_Density=model.materials["Constrained_Layer_Material"].density.table[0][0],
+                        Constrained_Elastic=constrained_elastic,
+                        Constrained_Poisson=model.materials["Constrained_Layer_Material"].elastic.table[0][1],
+                        Constrained_Loss_Factor=model.materials["Constrained_Layer_Material"].damping.structural,
                         Thickness_Field_Implementation=field_implementation,
                         Geometry_Builder_Version=config.GEOMETRY_BUILDER_VERSION,
                         Dataset_Source=dataset_source, **checks)
@@ -130,7 +152,12 @@ def run_frame(parameters, run_directory, job_name, split_xy=False, mesh_level=No
         # FrequencyStep's 500 Hz maxEigen ceiling without invalidating an
         # otherwise stable, positive first-eight result.
         all_positive=extract_positive_frequencies(odb)
-        primary_required=min(8, mode_count)
+        # Formal Pilot/Formal60 workflows retain their historical requirement
+        # of eight positive modes.  A target-frequency validation instead
+        # needs a valid spectrum covering the target, not an arbitrary eighth
+        # mode below the 500 Hz upper limit.
+        primary_required = (min(8, mode_count) if minimum_required_modes is None
+                            else int(minimum_required_modes))
         if len(all_positive)<primary_required:
             raise RuntimeError("Expected at least {0} positive frequencies, found {1}.".format(primary_required, len(all_positive)))
         values=all_positive[:mode_count]

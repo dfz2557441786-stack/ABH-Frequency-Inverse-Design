@@ -122,7 +122,9 @@ def extract_staged_modal(request):
         modes=[(int(f.mode),float(f.frequency)) for f in odb.steps["Step-1"].frames if getattr(f,"mode",0)>0]
         if any(not math.isfinite(f) or f<1 for _,f in modes):raise RuntimeError("ABNORMAL_MODAL_FREQUENCY")
         modes=[(m,f) for m,f in modes if 0<f<=500.00001]
-        if len(modes)<8:raise RuntimeError("INSUFFICIENT_POSITIVE_MODES")
+        target_frequency = float(request["Candidate"]["Target_Frequency_Hz"])
+        if not modes or max(f for _, f in modes) < target_frequency:
+            raise RuntimeError("TARGET_FREQUENCY_NOT_COVERED_BY_EXTRACTED_SPECTRUM")
         counts={name:{"nodes":len(i.nodes),"elements":len(i.elements)} for name,i in odb.rootAssembly.instances.items()}
     finally:odb.close()
     masses=extract_odb_attachment_masses(odb_path)
@@ -180,14 +182,17 @@ def run_generated_design(request_path):
                          mode_count=999,field_implementation=config.THICKNESS_FIELD_IMPLEMENTATION,
                          dataset_source="FREQUENCY_9D_GENERATED_VALIDATION",
                          resource_policy=request.get("Resource_Policy"),
-                         submit_job=request.get("Stage")!="BUILD")
+                         submit_job=request.get("Stage")!="BUILD",
+                         minimum_required_modes=1)
         if request.get("Stage")=="BUILD":
             result["Status"]="INP_READY"
             with open(request["Result_Path"],"w") as handle:json.dump(result,handle,indent=2)
             return result
         from frequency_extractor import extract_positive_frequencies
         frequencies=extract_positive_frequencies(result["ODB_Path"])
-        if len(frequencies)<8 or not all(math.isfinite(float(f)) and f>0 for f in frequencies):
+        target_frequency = float(request["Candidate"]["Target_Frequency_Hz"])
+        if (not frequencies or not all(math.isfinite(float(f)) and f>0 for f in frequencies)
+                or max(frequencies) < target_frequency):
             raise RuntimeError("INVALID_PRIMARY_FREQUENCY_EXPORT")
         if not all(math.isfinite(float(m)) and m>0 for m in result["masses"].values()):
             raise RuntimeError("INVALID_ATTACHMENT_MASS_EXPORT")
