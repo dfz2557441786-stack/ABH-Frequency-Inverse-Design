@@ -36,6 +36,7 @@ from target_retrieval import (_load_valid_modes, MODAL_DATABASE, REQUIRED_11D, r
 from general_geometry_validator import validate_general
 from abaqus_cleanup import cleanup_abaqus_job
 from damping_policy import fixed_band_width_to_rx_ry
+from damping_mapping import shell_outer_dimensions
 
 GEOMETRY = tuple(k for k in REQUIRED_11D if k not in ("rx", "ry"))
 FEATURES = GEOMETRY + ("rx", "ry")
@@ -663,7 +664,7 @@ def run_fixed_band_anchor_check(target, additional, dataset_csv):
     return result
 
 
-def _fixed_band_geometry_valid(vector, lower, upper):
+def _fixed_band_geometry_valid(vector, lower, upper, shell_size_bounds_mm=None):
     """生成阶段的代数约束；并保留距离边界的安全余量。"""
     p = dict(zip(FIXED_BAND_9D, vector))
     if np.any(vector < lower) or np.any(vector > upper):
@@ -678,11 +679,29 @@ def _fixed_band_geometry_valid(vector, lower, upper):
         damping = fixed_band_width_to_rx_ry(p, 0.015, 0.015)
     except (ValueError, KeyError):
         return False, "FIXED_15MM_DAMPING_NOT_FEASIBLE", None
+    full = dict(config.FIXED_BASELINE_PARAMETERS)
+    full.update(p)
+    dimensions = shell_outer_dimensions(full)
+    if shell_size_bounds_mm is not None:
+        try:
+            x_min, x_max = map(float, shell_size_bounds_mm["length_x_mm"])
+            y_min, y_max = map(float, shell_size_bounds_mm["width_y_mm"])
+        except (KeyError, TypeError, ValueError):
+            return False, "INVALID_ABH_SHELL_SIZE_CONSTRAINT", None
+        # A zero lower bound deliberately means "no lower size limit".
+        if not (0.0 <= x_min <= x_max and 0.0 <= y_min <= y_max):
+            return False, "INVALID_ABH_SHELL_SIZE_CONSTRAINT", None
+        if not x_min <= dimensions["ABH_Shell_Overall_Length_X_m"] * 1000.0 <= x_max:
+            return False, "ABH_SHELL_LENGTH_X_OUT_OF_RANGE", None
+        if not y_min <= dimensions["ABH_Shell_Overall_Width_Y_m"] * 1000.0 <= y_max:
+            return False, "ABH_SHELL_WIDTH_Y_OUT_OF_RANGE", None
+    damping.update(dimensions)
     return True, "OK", damping
 
 
 def _fixed_band_generate_for_target(target, model, train_rows, train_x, train_y,
-                                    lower, upper, count, seed, excluded_ids=None):
+                                    lower, upper, count, seed, excluded_ids=None,
+                                    shell_size_bounds_mm=None):
     """Generate only locally supported, database-external target candidates.
 
     A global sorted-mode surrogate can report an artificial exact target while
@@ -710,6 +729,13 @@ def _fixed_band_generate_for_target(target, model, train_rows, train_x, train_y,
 
     anchors = []
     for row, spectrum in enumerate(train_y):
+        # 外轮廓约束是本轮设计的硬条件。不能让一个本身无法制造的历史
+        # 样本充当局部反向优化锚点，否则优化器会反复走向超尺寸区域。
+        # 这不会删除训练数据；它只限制新构型从哪些真实可行点附近出发。
+        anchor_valid, _, _ = _fixed_band_geometry_valid(
+            train_x[row], lower, upper, shell_size_bounds_mm)
+        if not anchor_valid:
+            continue
         mode = int(np.argmin(np.abs(spectrum - target)))
         detuning = float(abs(spectrum[mode] - target) / target * 100.0)
         if detuning <= FIXED_BAND_TARGET_POLICY["anchor_detuning_percent"]:
@@ -729,7 +755,9 @@ def _fixed_band_generate_for_target(target, model, train_rows, train_x, train_y,
     radius = float(FIXED_BAND_TARGET_POLICY["local_trust_radius"])
     minimum_new_distance = float(FIXED_BAND_TARGET_POLICY["minimum_new_distance"])
     optimization_attempts = 0
-    for anchor_detuning, row, selected_mode in anchors[:min(80, len(anchors))]:
+    max_anchor_attempts = int(FIXED_BAND_TARGET_POLICY.get(
+        "max_anchor_attempts", 80))
+    for anchor_detuning, row, selected_mode in anchors[:min(max_anchor_attempts, len(anchors))]:
         optimization_attempts += 1
         anchor = train_x[row]
         anchor_frequency = float(train_y[row, selected_mode])
@@ -761,7 +789,8 @@ def _fixed_band_generate_for_target(target, model, train_rows, train_x, train_y,
                    anchor_detuning, Optimizer_Message=str(result.message))
             continue
         vector = lower + result.x * width
-        valid, reason, damping = _fixed_band_geometry_valid(vector, lower, upper)
+        valid, reason, damping = _fixed_band_geometry_valid(
+            vector, lower, upper, shell_size_bounds_mm)
         distance = float(np.min(np.linalg.norm((vector - train_x) / width, axis=1)))
         anchor_distance = float(np.linalg.norm((vector - anchor) / width))
         if not valid:
@@ -816,6 +845,8 @@ def _fixed_band_generate_for_target(target, model, train_rows, train_x, train_y,
                     "New_Geometry": True, "Data_Library": FIXED_BAND_LIBRARY,
                     "Damping_Inward_X_m": 0.015, "Damping_Inward_Y_m": 0.015,
                     "rx_for_v2_builder": damping["rx"], "ry_for_v2_builder": damping["ry"],
+                    "ABH_Shell_Overall_Length_X_m": damping["ABH_Shell_Overall_Length_X_m"],
+                    "ABH_Shell_Overall_Width_Y_m": damping["ABH_Shell_Overall_Width_Y_m"],
                     "Damping_Configuration": damping["Damping_Configuration"],
                     "Prediction_Status": "EXPLORATORY_UQ_NOT_PASSED_REQUIRES_ABAQUS",
                     "Uncertainty_Calibration_Status": "UNCALIBRATED_NOT_A_95_PERCENT_GUARANTEE",
@@ -852,6 +883,8 @@ def _fixed_band_generate_for_target(target, model, train_rows, train_x, train_y,
             "New_Geometry": True, "Data_Library": FIXED_BAND_LIBRARY,
             "Damping_Inward_X_m": 0.015, "Damping_Inward_Y_m": 0.015,
             "rx_for_v2_builder": damping["rx"], "ry_for_v2_builder": damping["ry"],
+            "ABH_Shell_Overall_Length_X_m": damping["ABH_Shell_Overall_Length_X_m"],
+            "ABH_Shell_Overall_Width_Y_m": damping["ABH_Shell_Overall_Width_Y_m"],
             "Damping_Configuration": damping["Damping_Configuration"],
             "Prediction_Status": "LOCAL_TRUST_REGION_SCREENED_REQUIRES_ABAQUS",
             "Uncertainty_Calibration_Status": "UNCALIBRATED_NOT_A_95_PERCENT_GUARANTEE",
@@ -924,7 +957,178 @@ def _fixed_band_validated_candidate_ids(output_dir):
                 str(row.get("Status", "")).strip() == "SUCCESS"}
 
 
-def run_fixed_band_frequency_generation(mode, target, additional, dataset_csv):
+def _fixed_band_far_target(target, model, rows, x, y, policy, seed,
+                           shell_size_bounds_mm=None):
+    """远距离探索：全库排斥距离 + 有界锚点邻域；不是已验证可信域。"""
+    lower, span = x.min(axis=0), np.ptp(x, axis=0)
+    if np.any(span <= 0):
+        raise ValueError("DEGENERATE_GEOMETRY_RANGE")
+    normalized = (x - lower) / span
+    tree = cKDTree(normalized)
+    rng = np.random.RandomState(seed)
+    nearest_mode = np.argmin(abs(y - target), axis=1)
+    # 锚点只按训练数据库实际频谱选取，允许全部24个排序模态。
+    anchor_ids = np.argsort(abs(y[np.arange(len(y)), nearest_mode] - target))[:min(120, len(x))]
+    anchor_choice = rng.choice(anchor_ids, policy["proposal_count"])
+    direction = rng.normal(size=(len(anchor_choice), x.shape[1]))
+    direction /= np.linalg.norm(direction, axis=1)[:, None]
+    radius = rng.uniform(policy["minimum_database_distance"] * 1.1,
+                         policy["maximum_anchor_distance"], len(direction))
+    proposals = normalized[anchor_choice] + direction * radius[:, None]
+    valid_box = np.all((proposals >= 0) & (proposals <= 1), axis=1)
+    proposals, anchor_choice = proposals[valid_box], anchor_choice[valid_box]
+    distance = tree.query(proposals)[0]
+    outside = distance >= policy["minimum_database_distance"]
+    proposals, anchor_choice = proposals[outside], anchor_choice[outside]
+    feasible = [_fixed_band_geometry_valid(
+        lower + q * span, lower, lower + span, shell_size_bounds_mm)[0] for q in proposals]
+    proposals, anchor_choice = proposals[feasible], anchor_choice[feasible]
+    diagnostic = {"Target_Frequency_Hz": target, "Random_Proposals": policy["proposal_count"],
+                  "Algebraically_Feasible_Far_Proposals": len(proposals), "Optimization_Attempts": 0,
+                  "Optimizer_Failed": 0, "Constraint_Rejected": 0, "Prediction_Rejected": 0}
+    if not len(proposals):
+        return [], [], diagnostic
+
+    def mean_only(vectors):
+        scaled = model.input_scaler.transform(np.atleast_2d(vectors))
+        return model.output_scaler.inverse_transform(model.model.predict(scaled))
+
+    with threadpool_limits(limits=1):
+        means = np.concatenate([mean_only(lower + proposals[i:i+128] * span)
+                                for i in range(0, len(proposals), 128)])
+        order = np.argsort(np.min(abs(means - target), axis=1))
+        # 多起点先去除相近起点，避免只围绕一个设计簇优化。
+        starts = []
+        for index in order:
+            if all(np.linalg.norm(proposals[index] - proposals[j]) >= policy["minimum_pair_distance"] for j in starts):
+                starts.append(index)
+            if len(starts) >= policy["optimization_starts"]:
+                break
+        accepted = []
+        for number, index in enumerate(starts):
+            anchor = normalized[anchor_choice[index]]
+            mode = int(np.argmin(abs(means[index] - target)))
+            def objective(q):
+                return float(((mean_only(lower + q * span)[0, mode] - target) / target) ** 2)
+            constraints = [
+                {"type": "ineq", "fun": lambda q: tree.query(q)[0] - policy["minimum_database_distance"]},
+                {"type": "ineq", "fun": lambda q: policy["maximum_anchor_distance"] - np.linalg.norm(q - anchor)},
+            ]
+            fit = minimize(objective, proposals[index], method="SLSQP", bounds=[(0., 1.)] * x.shape[1],
+                           constraints=constraints, options={"maxiter": policy["optimizer_maxiter"], "ftol": 1e-12})
+            diagnostic["Optimization_Attempts"] += 1
+            if not fit.success:
+                diagnostic["Optimizer_Failed"] += 1
+                continue
+            vector = lower + fit.x * span
+            distance, nearest = tree.query(fit.x)
+            valid, reason, damping = _fixed_band_geometry_valid(
+                vector, lower, lower + span, shell_size_bounds_mm)
+            if (not valid or distance < policy["minimum_database_distance"] - 1e-8 or
+                    np.linalg.norm(fit.x - anchor) > policy["maximum_anchor_distance"] + 1e-8):
+                diagnostic["Constraint_Rejected"] += 1
+                continue
+            mean, std = model.predict(vector)
+            mode = int(np.argmin(abs(mean[0] - target)))
+            error, uncertainty = abs(mean[0, mode] - target) / target * 100, std[0, mode] / target * 100
+            if (not np.all(np.isfinite(mean)) or not np.all(np.isfinite(std)) or np.min(mean) <= 0 or
+                    error > policy["prediction_tolerance_percent"] or
+                    uncertainty > policy["maximum_prediction_std_percent"]):
+                diagnostic["Prediction_Rejected"] += 1
+                continue
+            parameters = dict(zip(FIXED_BAND_9D, map(float, vector)))
+            candidate = dict(parameters)
+            candidate.update({
+                "Candidate_ID": "FB15EXP_" + hashlib.sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()[:12],
+                "Target_Frequency_Hz": target, "Predicted_Mode_Index": mode + 1,
+                "Predicted_Frequency_Hz": float(mean[0, mode]), "Predicted_STD_Hz": float(std[0, mode]),
+                "Predicted_Error_Percent": float(error), "Prediction_STD_Percent": float(uncertainty),
+                "Nearest_Training_Distance": float(distance), "Nearest_Database_Sample_ID": rows[nearest]["Sample_ID"],
+                "Anchor_Distance": float(np.linalg.norm(fit.x - anchor)),
+                "Nearest_Database_Mode_Index": int(nearest_mode[nearest]) + 1,
+                "Nearest_Database_Frequency_Hz": float(y[nearest, nearest_mode[nearest]]),
+                "Geometry_Valid": True, "Geometry_Check_Level": "ALGEBRAIC_ONLY_NOT_MESH_OR_FE",
+                "New_Geometry": True, "Data_Library": FIXED_BAND_LIBRARY,
+                "Damping_Inward_X_m": 0.015, "Damping_Inward_Y_m": 0.015,
+                "rx_for_v2_builder": damping["rx"], "ry_for_v2_builder": damping["ry"],
+                "ABH_Shell_Overall_Length_X_m": damping["ABH_Shell_Overall_Length_X_m"],
+                "ABH_Shell_Overall_Width_Y_m": damping["ABH_Shell_Overall_Width_Y_m"],
+                "Damping_Configuration": damping["Damping_Configuration"],
+                "Prediction_Status": "FAR_EXPLORATORY_REQUIRES_ABAQUS",
+                "Physical_Mode_Identity": "UNCONFIRMED", "Abaqus_Validated": False,
+                "Uncertainty_Calibration_Status": "UNCALIBRATED_NOT_A_95_PERCENT_GUARANTEE",
+                "Spectrum_Inversion": bool(np.any(np.diff(mean[0]) < 0)),
+                "Boundary_Margin_Normalized": float(np.min(np.minimum(fit.x, 1 - fit.x))),
+            })
+            accepted.append((candidate, fit.x, int(nearest)))
+            if (number + 1) % 6 == 0:
+                print("FAR_SEARCH target=%g starts=%d/%d accepted=%d" % (target, number+1, len(starts), len(accepted)), flush=True)
+    selected, differences, positions = [], [], []
+    for candidate, position, nearest in sorted(accepted, key=lambda item: (item[0]["Spectrum_Inversion"], item[0]["Prediction_STD_Percent"], item[0]["Predicted_Error_Percent"])):
+        if any(np.linalg.norm(position - q) < policy["minimum_pair_distance"] for q in positions):
+            continue
+        selected.append(candidate)
+        positions.append(position)
+        for j, key in enumerate(FIXED_BAND_9D):
+            scale, unit = (180 / math.pi, "deg") if key == "theta" else ((1., "dimensionless") if key == "power_law" else (1000., "mm"))
+            differences.append({"Candidate_ID": candidate["Candidate_ID"], "Target_Frequency_Hz": target,
+                "Nearest_Database_Sample_ID": rows[nearest]["Sample_ID"], "Parameter": key, "Unit": unit,
+                "Candidate_Value": candidate[key] * scale, "Database_Value": float(x[nearest,j]) * scale,
+                "Difference": (candidate[key] - float(x[nearest,j])) * scale,
+                "Difference_Fraction_of_Database_Range": (candidate[key] - float(x[nearest,j])) / span[j]})
+        if len(selected) >= policy["candidate_count"]:
+            break
+    diagnostic["Selected_Candidates"] = len(selected)
+    return selected, differences, diagnostic
+
+
+def run_fixed_band_far_generation(target, additional, dataset_csv, policy,
+                                  shell_size_bounds_mm=None):
+    """单独保存远距离探索成果；不覆盖生产模型、不提交有限元。"""
+    targets = list(dict.fromkeys([float(target)] + list(map(float, additional))))
+    if any(not np.isfinite(t) or t <= 0 for t in targets):
+        raise ValueError("INVALID_TARGET_FREQUENCY")
+    if not 0 < policy["minimum_database_distance"] < policy["maximum_anchor_distance"]:
+        raise ValueError("INVALID_FAR_DISTANCE_POLICY")
+    for key in ("candidate_count", "proposal_count", "optimization_starts", "optimizer_maxiter", "training_maxiter"):
+        if isinstance(policy[key], bool) or int(policy[key]) != policy[key] or policy[key] <= 0:
+            raise ValueError("INVALID_FAR_SEARCH_COUNT:" + key)
+    for key in ("minimum_pair_distance", "prediction_tolerance_percent", "maximum_prediction_std_percent"):
+        if not np.isfinite(policy[key]) or policy[key] <= 0:
+            raise ValueError("INVALID_FAR_SEARCH_THRESHOLD:" + key)
+    rows, x, y = _fixed_band_training_data(dataset_csv)
+    identity = hashlib.sha256(x.tobytes() + y.tobytes() + str(policy["training_maxiter"]).encode() + b"FAR_V1").hexdigest()
+    root = ensure_directory(os.path.join(BASE_OUTPUT, "fixed_band_15mm", "far_generated"))
+    output = ensure_directory(os.path.join(root, datetime.now().strftime("%Y%m%d_%H%M%S_%f")))
+    cache = ensure_directory(os.path.join(root, "model_cache", identity[:16]))
+    print("FAR_SEARCH_TRAIN_OR_LOAD geometries=%d; ABAQUS=DISABLED" % len(rows), flush=True)
+    fitted = _fixed_band_fit_cached(cache, "experimental_spectrum", x, y, {"optimizer_maxiter": policy["training_maxiter"]})
+    candidates, differences, diagnostics = [], [], []
+    for i, frequency in enumerate(targets):
+        print("FAR_SEARCH_START target=%g" % frequency, flush=True)
+        found, delta, diagnostic = _fixed_band_far_target(
+            frequency, fitted["model"], rows, x, y, policy, policy["seed"] + i,
+            shell_size_bounds_mm)
+        candidates.extend(found); differences.extend(delta); diagnostics.append(diagnostic)
+        write_csv(os.path.join(output, "far_candidates.csv"), candidates)
+        write_csv(os.path.join(output, "nearest_geometry_differences.csv"), differences)
+        print(json.dumps(diagnostic), flush=True)
+    user_prediction_path = write_fixed_band_user_prediction_table(candidates, "GENERATE_FAR")
+    summary = {"Status": "FAR_CANDIDATES_NOT_FE_VALIDATED" if candidates else "NO_FAR_CANDIDATES",
+               "Abaqus_Job_Submitted": False, "Training_Geometries": len(rows),
+               "Data_Array_SHA256": identity, "Policy": policy, "Targets": targets,
+               "Diagnostics": diagnostics, "Candidate_Count": len(candidates), "Output_Directory": output,
+               "ABH_Shell_Size_Constraint_mm": shell_size_bounds_mm,
+               "User_Prediction_Table": user_prediction_path,
+               "Model_Training_Warnings": fitted["warnings"],
+               "Distance_Normalization": {k: {"min": float(x[:,j].min()), "max": float(x[:,j].max())} for j,k in enumerate(FIXED_BAND_9D)}}
+    save_json(os.path.join(output, "run_manifest.json"), summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    return summary
+
+
+def run_fixed_band_frequency_generation(mode, target, additional, dataset_csv,
+                                        shell_size_bounds_mm=None):
     """固定 15 mm 数据库的训练和多解生成；本函数绝不提交 Abaqus。"""
     if mode != "GENERATE":
         raise RuntimeError("FIXED_BAND_15MM_CURRENTLY_SUPPORTS_GENERATE_ONLY")
@@ -940,7 +1144,7 @@ def run_fixed_band_frequency_generation(mode, target, additional, dataset_csv):
         generated = _fixed_band_generate_for_target(
             target_value, model, rows, x, y, lower, upper,
             count=FIXED_BAND_TARGET_POLICY["candidate_count"], seed=20261013 + index,
-            excluded_ids=validated_ids)
+            excluded_ids=validated_ids, shell_size_bounds_mm=shell_size_bounds_mm)
         candidates.extend(generated["candidates"])
         exploratory_candidates.extend(generated.get("exploratory_candidates", []))
         rejections.extend(generated["rejections"])
@@ -963,6 +1167,8 @@ def run_fixed_band_frequency_generation(mode, target, additional, dataset_csv):
                                       "Rejected_Attempts": count_value})
     rejection_summary_path = os.path.join(output, "fixed_band_15mm_generation_rejection_summary.csv")
     write_csv(rejection_summary_path, rejection_summary)
+    user_prediction_path = write_fixed_band_user_prediction_table(
+        candidates + exploratory_candidates, "GENERATE_LOCAL")
     summary = {
         # 空候选是可信域/UQ筛选的正常结果，不能伪装成已经生成但尚未验证。
         "Status": ("GENERATED_NOT_ABAQUS_VALIDATED" if candidates else
@@ -976,11 +1182,13 @@ def run_fixed_band_frequency_generation(mode, target, additional, dataset_csv):
         "Previously_Validated_Candidate_IDs_Excluded": len(validated_ids),
         "Generation_Method": "LOCAL_TARGET_MATCHING_ANCHOR_PLUS_UQ_HARD_GATE",
         "Generation_Policy": FIXED_BAND_TARGET_POLICY,
+        "ABH_Shell_Size_Constraint_mm": shell_size_bounds_mm,
         "Target_Diagnostics": diagnostics,
         "Output": os.path.join(output, "fixed_band_15mm_new_abh_candidates.csv"),
         "Exploratory_Output": exploratory_path,
         "Rejection_Output": rejection_path,
         "Rejection_Summary_Output": rejection_summary_path,
+        "User_Prediction_Table": user_prediction_path,
     }
     save_json(os.path.join(output, "fixed_band_15mm_generation_summary.json"), summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
@@ -1000,6 +1208,123 @@ def write_csv(path, rows):
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader(); writer.writerows(rows)
     os.replace(path + ".pending", path)
+
+
+def _fixed_band_user_view_directory():
+    """日常查看入口：只保留预测表和验证表，不替代技术台账。"""
+    return ensure_directory(os.path.join(
+        BASE_OUTPUT, "fixed_band_15mm", "用户查看"))
+
+
+def write_fixed_band_user_prediction_table(candidate_rows, generation_source):
+    """将本轮生成结果压缩为一张面向用户的预测表。"""
+    fields = ("Candidate_ID", "Target_Frequency_Hz", "Predicted_Frequency_Hz",
+              "Predicted_Mode_Index", "Predicted_STD_Hz", "Prediction_STD_Percent",
+              "Nearest_Training_Distance", "Nearest_Database_Sample_ID",
+              "Prediction_Status", "Geometry_Valid", "New_Geometry",
+              "Damping_Inward_X_m", "Damping_Inward_Y_m",
+              "ABH_Shell_Overall_Length_X_m", "ABH_Shell_Overall_Width_Y_m") + tuple(FIXED_BAND_9D)
+    rows = []
+    for raw in candidate_rows:
+        row = {field: raw.get(field, "") for field in fields}
+        # 旧局部候选以Predicted_Raw_Mode命名；用户表统一显示为预测模态阶次。
+        if not row["Predicted_Mode_Index"]:
+            row["Predicted_Mode_Index"] = raw.get("Predicted_Raw_Mode", "")
+        row["Generation_Source"] = generation_source
+        rows.append(row)
+    path = os.path.join(_fixed_band_user_view_directory(), "预测表.csv")
+    write_csv(path, rows)
+    return path
+
+
+def write_fixed_band_user_validation_table(ledger_path, candidate_ids=None):
+    """从完整FE台账导出一张可直接判断频率是否命中的验证表。"""
+    if not os.path.isfile(ledger_path):
+        return None
+    with open(ledger_path, newline="", encoding="utf-8-sig") as stream:
+        source = list(csv.DictReader(stream))
+    if candidate_ids is not None:
+        allowed = {str(value).strip() for value in candidate_ids}
+        source = [row for row in source if str(row.get("Candidate_ID", "")).strip() in allowed]
+    fields = ("Candidate_ID", "Status", "Target_Frequency_Hz", "Predicted_Frequency_Hz",
+              "Predicted_Raw_Mode", "Abaqus_Frequency_Hz", "Abaqus_Raw_Mode",
+              "Frequency_Error_Percent", "Frequency_Match_PASS", "Mode_Match_Status",
+              "Positive_Mode_Count", "FE_Elapsed_Seconds", "Nearest_Database_Geometry_Distance",
+              "Geometry_Valid", "Mesh_Valid", "ODB_Valid", "Failure_Reason",
+              "Damping_Inward_X_m", "Damping_Inward_Y_m",
+              "ABH_Shell_Overall_Length_X_m", "ABH_Shell_Overall_Width_Y_m") + tuple(FIXED_BAND_9D)
+    rows = [{field: raw.get(field, "") for field in fields} for raw in source]
+    path = os.path.join(_fixed_band_user_view_directory(), "验证表.csv")
+    write_csv(path, rows)
+    return path
+
+
+def write_fixed_band_frequency_qualified_pool(validation_rows, candidate_ids=None):
+    """导出真实 Abaqus 频率通过的候选池，供后续耦合减振筛选使用。
+
+    这里的合格只表示独立 ABH 在目标频率的最近排序模态满足 ±2%。它不暗示
+    Host--RABH 已产生减振效果，也不会自行启动任何耦合、PSD 或疲劳作业。
+    """
+    allowed = None
+    if candidate_ids is not None:
+        allowed = {str(value).strip() for value in candidate_ids}
+
+    pool = []
+    for raw in validation_rows:
+        candidate_id = str(raw.get("Candidate_ID", "")).strip()
+        if allowed is not None and candidate_id not in allowed:
+            continue
+        if str(raw.get("Status", "")).upper() != "SUCCESS":
+            continue
+        passed = str(raw.get("Frequency_Match_PASS", "")).strip().lower()
+        if passed not in ("true", "1", "yes"):
+            continue
+        row = dict(raw)
+        row["Frequency_Selection_Status"] = "FREQUENCY_QUALIFIED_FOR_COUPLED_SCREENING"
+        row["Coupled_Validation_Status"] = "NOT_RUN"
+        row["Dynamic_Response_Status"] = "NOT_RUN"
+        pool.append(row)
+
+    pool.sort(key=lambda item: (float(item.get("Target_Frequency_Hz", 0.0)),
+                                float(item.get("Frequency_Error_Percent", "inf"))))
+    for index, row in enumerate(pool, 1):
+        row["Frequency_Qualified_Rank"] = index
+
+    output_dir = _fixed_band_user_view_directory()
+    fields = (
+        "Frequency_Qualified_Rank", "Frequency_Selection_Status",
+        "Coupled_Validation_Status", "Dynamic_Response_Status", "Candidate_ID",
+        "Target_Frequency_Hz", "Abaqus_Frequency_Hz", "Abaqus_Raw_Mode",
+        "Frequency_Error_Percent", "Predicted_Frequency_Hz", "Predicted_Raw_Mode",
+        "RABH_Assembly_Mass", "Nearest_Database_Geometry_Distance",
+        "ABH_Shell_Overall_Length_X_m", "ABH_Shell_Overall_Width_Y_m",
+        "Damping_Inward_X_m", "Damping_Inward_Y_m",
+    ) + tuple(FIXED_BAND_9D)
+    pool_path = os.path.join(output_dir, "频率合格候选池.csv")
+    write_csv(pool_path, [{field: row.get(field, "") for field in fields} for row in pool])
+
+    by_target = {}
+    for row in pool:
+        target = row.get("Target_Frequency_Hz", "")
+        by_target[target] = by_target.get(target, 0) + 1
+    report_path = os.path.join(output_dir, "频率合格候选池说明.md")
+    lines = [
+        "# 固定 15 mm 阻尼带：频率合格候选池",
+        "",
+        "本表只保留独立 Abaqus 模态计算成功，且目标频率误差不超过 2% 的新构型。",
+        "频率合格不等价于耦合减振性能合格；Host--RABH 耦合、动态响应、PSD 和疲劳均尚未运行。",
+        "",
+        "## 数量",
+        "",
+        "- 总数：%d" % len(pool),
+    ]
+    for target in sorted(by_target, key=lambda item: float(item)):
+        lines.append("- %s Hz：%d 个" % (target, by_target[target]))
+    with open(report_path, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(lines) + "\n")
+    return {"Frequency_Qualified_Pool": pool_path,
+            "Frequency_Qualified_Pool_Report": report_path,
+            "Frequency_Qualified_Count": len(pool)}
 
 
 def read_json(path):
@@ -1500,6 +1825,9 @@ def validate_fixed_band_saved_candidate(candidate_id, candidate_csv=None):
     if abs(band_x - 0.015) > 1.0e-12 or abs(band_y - 0.015) > 1.0e-12:
         raise RuntimeError("FIXED_BAND_15MM_VALIDATION_REQUIRES_X15MM_Y15MM")
     damping = fixed_band_width_to_rx_ry(candidate, band_x, band_y)
+    full_geometry = dict(config.FIXED_BASELINE_PARAMETERS)
+    full_geometry.update(candidate)
+    shell_dimensions = shell_outer_dimensions(full_geometry)
     candidate.update({
         "Candidate_ID": candidate_id,
         "Target_Frequency_Hz": float(raw["Target_Frequency_Hz"]),
@@ -1512,6 +1840,8 @@ def validate_fixed_band_saved_candidate(candidate_id, candidate_csv=None):
         "Damping_Configuration": damping["Damping_Configuration"],
         "rx": damping["rx"],
         "ry": damping["ry"],
+        "ABH_Shell_Overall_Length_X_m": shell_dimensions["ABH_Shell_Overall_Length_X_m"],
+        "ABH_Shell_Overall_Width_Y_m": shell_dimensions["ABH_Shell_Overall_Width_Y_m"],
         "Validation_Model": "FIXED_BAND_15MM",
         "Data_Library": FIXED_BAND_LIBRARY,
     })
@@ -1523,6 +1853,7 @@ def validate_fixed_band_saved_candidate(candidate_id, candidate_csv=None):
                    if str(row.get("Candidate_ID", "")).strip() == candidate_id
                    and row.get("Status") == "SUCCESS"]
         if old:
+            write_fixed_band_user_validation_table(validation_csv, [candidate_id])
             result = dict(old[-1])
             result.update({"Status": "ALREADY_VALIDATED_NO_RESUBMIT",
                            "Abaqus_Job_Submitted": False,
@@ -1562,6 +1893,8 @@ def validate_fixed_band_saved_candidate(candidate_id, candidate_csv=None):
                        "Damping_Inward_Y_m": band_y,
                        "rx_for_v2_builder": damping["rx"],
                        "ry_for_v2_builder": damping["ry"],
+                       "ABH_Shell_Overall_Length_X_m": shell_dimensions["ABH_Shell_Overall_Length_X_m"],
+                       "ABH_Shell_Overall_Width_Y_m": shell_dimensions["ABH_Shell_Overall_Width_Y_m"],
                        "Damping_Configuration": damping["Damping_Configuration"],
                        "Validation_Model": "FIXED_BAND_15MM"})
         state.setdefault("Validation", {})[candidate_id] = record
@@ -1569,6 +1902,7 @@ def validate_fixed_band_saved_candidate(candidate_id, candidate_csv=None):
         # Rebuild from all one-candidate checkpoints so an individual run
         # cannot overwrite an earlier validation result.
         validation_csv, _ = rebuild_fixed_band_validation_ledger()
+        write_fixed_band_user_validation_table(validation_csv, [candidate_id])
 
     submitted = bool(state.get("Jobs", {}).get(candidate_id, {}).get("PID"))
     result = dict(record, Abaqus_Job_Submitted=submitted,
@@ -1603,10 +1937,33 @@ def validate_fixed_band_saved_candidates_batch(candidate_ids, candidate_csv=None
 
     with open(source_csv, newline="", encoding="utf-8-sig") as stream:
         source_rows = list(csv.DictReader(stream))
+    # 在提交任何 Abaqus Job 前验证候选CSV物理字段。曾出现把远距离候选复制
+    # 到旧表后因字段列顺序不同而错位的情况；绝不能把rx/ry误作15 mm带宽。
+    required_fields = set(FIXED_BAND_9D) | {
+        "Candidate_ID", "Target_Frequency_Hz", "Predicted_Frequency_Hz",
+        "Predicted_Mode_Index", "Damping_Inward_X_m", "Damping_Inward_Y_m",
+    }
+    missing_fields = sorted(required_fields - set(source_rows[0] if source_rows else {}))
+    if missing_fields:
+        raise RuntimeError("FIXED_BAND_CANDIDATE_CSV_SCHEMA_MISSING_FIELDS:" + ",".join(missing_fields))
     source_ids = [str(row.get("Candidate_ID", "")).strip() for row in source_rows]
     missing = [item for item in ids if source_ids.count(item) != 1]
     if missing:
         raise RuntimeError("BATCH_CANDIDATE_ID_NOT_FOUND_OR_NOT_UNIQUE:" + ",".join(missing))
+    selected_rows = [next(row for row in source_rows if str(row.get("Candidate_ID", "")).strip() == item)
+                     for item in ids]
+    malformed = []
+    for row in selected_rows:
+        try:
+            band_x = float(row["Damping_Inward_X_m"])
+            band_y = float(row["Damping_Inward_Y_m"])
+        except (TypeError, ValueError):
+            malformed.append(str(row.get("Candidate_ID", "")) + ":NON_NUMERIC_DAMPING_WIDTH")
+            continue
+        if abs(band_x - 0.015) > 1.0e-12 or abs(band_y - 0.015) > 1.0e-12:
+            malformed.append("%s:X=%g,Y=%g" % (row["Candidate_ID"], band_x, band_y))
+    if malformed:
+        raise RuntimeError("FIXED_BAND_CANDIDATE_CSV_SCHEMA_OR_DAMPING_MISMATCH:" + ";".join(malformed))
 
     ledger_path = os.path.join(output_dir, "fixed_band_15mm_abaqus_validation.csv")
     existing = {}
@@ -1660,9 +2017,13 @@ def validate_fixed_band_saved_candidates_batch(candidate_ids, candidate_csv=None
     checkpoint.update({"Status": "COMPLETED", "Completed_UTC": datetime.now(timezone.utc).isoformat(),
                        "Abaqus_Jobs_Submitted": submitted})
     save_json(checkpoint_path, checkpoint)
+    user_validation_path = write_fixed_band_user_validation_table(ledger_path, ids)
+    qualified_pool = write_fixed_band_frequency_qualified_pool(records, ids)
     payload = {"Status": "BATCH_VALIDATION_COMPLETED", "Requested_Candidates": len(ids),
                "Abaqus_Jobs_Submitted": submitted, "Batch_Summary_CSV": batch_csv,
                "Checkpoint": checkpoint_path, "Validation_Ledger": ledger_path,
+               "User_Validation_Table": user_validation_path,
+                "Frequency_Qualified_Pool": qualified_pool,
                "Sequential": True}
     print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
     return payload

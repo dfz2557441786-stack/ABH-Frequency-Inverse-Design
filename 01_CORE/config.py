@@ -233,17 +233,20 @@ FREQUENCY9D_POLICY = {
 # geometry close to an *actual* target-matching database anchor.  A predicted
 # exact frequency alone never qualifies a candidate for Abaqus validation.
 FIXED_BAND_TARGET_GENERATION_POLICY = {
-    "candidate_count": 8, #严格通过不确定度门槛的正式候选数量
+    # 先建立足够大的候选池；后续质量、减振或寿命约束从该池中筛选。
+    # 这里仅生成/排序，绝不自动提交 Abaqus。
+    "candidate_count": 12, #严格通过不确定度门槛的正式候选数量
     "match_percent": 2.0,
     "anchor_detuning_percent": 1.0,
     "local_trust_radius": 0.035,
     "minimum_new_distance": 0.004,
-    "minimum_pair_distance": 0.060,
+    "minimum_pair_distance": 0.030,
+    "max_anchor_attempts": 120,
     "maximum_prediction_std_percent": 2.0,
     "upper_confidence_multiplier": 1.96,
     # 严格门槛未通过时，仍可单独导出少量“探索候选”，供人工选择后
     # 进行独立 Abaqus 验证。它们绝不写入严格候选表，也不表示频率已满足。
-    "exploratory_candidate_count": 6, #严格门槛未通过时，仍导出供 Abaqus 验证的探索候选数量。
+    "exploratory_candidate_count": 30, #严格门槛未通过时，仍导出供 Abaqus 验证的探索候选数量。
     "exploratory_max_prediction_std_percent": 12.0,
 }
 # 零有限元成本的模型检查：只比较实验模型，不自动替换生产模型。

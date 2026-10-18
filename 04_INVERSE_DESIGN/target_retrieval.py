@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import config
 from paths import RESULTS_DIR, RESULTS_INVERSE_DIR, ensure_directory
+from damping_mapping import shell_outer_dimensions
 
 
 MODAL_DATABASE = os.path.join(RESULTS_DIR, "v2_unified_all_modes_effective_mass_long.csv")
@@ -43,6 +44,33 @@ def _optional_number(row, key):
         return _number(row, key)
     except ValueError:
         return None
+
+
+def _fixed_band_shell_dimensions(parameters):
+    """Calculate V2 ABH-shell outer size from the actual geometry equations."""
+    full = dict(config.FIXED_BASELINE_PARAMETERS)
+    full.update(parameters)
+    return shell_outer_dimensions(full)
+
+
+def _shell_size_bounds_m(request):
+    """Read optional user-facing shell-envelope limits, expressed in mm."""
+    if not bool(getattr(request, "USE_ABH_SHELL_SIZE_FILTER", False)):
+        return None
+    raw_x = getattr(request, "ABH_SHELL_OVERALL_LENGTH_X_MM_RANGE", None)
+    raw_y = getattr(request, "ABH_SHELL_OVERALL_WIDTH_Y_MM_RANGE", None)
+    try:
+        x_min, x_max = map(float, raw_x)
+        y_min, y_max = map(float, raw_y)
+    except (TypeError, ValueError):
+        raise ValueError("ABH_SHELL_SIZE_RANGE_MUST_HAVE_TWO_NUMBERS_IN_MM")
+    # 0 mm is a supported lower bound: it means only an upper envelope limit.
+    if not (0.0 <= x_min <= x_max and 0.0 <= y_min <= y_max):
+        raise ValueError("ABH_SHELL_SIZE_RANGE_INVALID")
+    return {
+        "length_x_m": (x_min / 1000.0, x_max / 1000.0),
+        "width_y_m": (y_min / 1000.0, y_max / 1000.0),
+    }
 
 
 def _formal_mass_index(path=FORMAL_BATCH1_DATABASE):
@@ -178,6 +206,7 @@ def _load_fixed_band_15mm_modes(dataset_path):
                         ),
                     }
                     record.update(parameters)
+                    record.update(_fixed_band_shell_dimensions(parameters))
                     modes.append(record)
             except (KeyError, TypeError, ValueError):
                 continue
@@ -203,6 +232,7 @@ def retrieve(request, database_path=MODAL_DATABASE):
         raise ValueError("ONLY_Z_EFFECTIVE_MODAL_MASS_IS_AVAILABLE")
     max_mass = getattr(request, "MAX_MASS", None)
     mass_filter = bool(getattr(request, "USE_MASS_FILTER", False))
+    shell_bounds = _shell_size_bounds_m(request)
     if mass_filter and max_mass is None:
         raise ValueError("MAX_MASS_REQUIRED_WHEN_MASS_FILTER_IS_TRUE")
 
@@ -211,6 +241,14 @@ def retrieve(request, database_path=MODAL_DATABASE):
         detuning = abs(row["Mode_Frequency_Hz"] - target) / target * 100.0
         if detuning > tolerance:
             continue
+        if shell_bounds is not None:
+            length = row.get("ABH_Shell_Overall_Length_X_m")
+            width = row.get("ABH_Shell_Overall_Width_Y_m")
+            if length is None or width is None:
+                raise ValueError("SHELL_SIZE_FILTER_UNAVAILABLE_FOR_SELECTED_DATA_LIBRARY")
+            if not (shell_bounds["length_x_m"][0] <= length <= shell_bounds["length_x_m"][1] and
+                    shell_bounds["width_y_m"][0] <= width <= shell_bounds["width_y_m"][1]):
+                continue
         if mass_filter and row["RABH_Assembly_Mass"] is None:
             raise ValueError("MASS_FILTER_UNAVAILABLE_FOR_SELECTED_DATA_LIBRARY")
         if mass_filter and row["RABH_Assembly_Mass"] > float(max_mass):
@@ -244,7 +282,7 @@ def _write_csv(path, rows, include_rank):
         "Effective_Mass_Ratio_Z", "ABH_Shell_Mass", "Damping_And_Constrained_Layer_Mass",
         "RABH_Assembly_Mass", "Abaqus_Total_Model_Mass_from_DAT", "Mass_Component_Status",
         "Mass_Definition", "Footprint", "Damping_Inward_X_m", "Damping_Inward_Y_m",
-        "Damping_Configuration",
+        "ABH_Shell_Overall_Length_X_m", "ABH_Shell_Overall_Width_Y_m", "Damping_Configuration",
     ) + REQUIRED_11D
     if include_rank:
         fields = ("Rank",) + fields
@@ -273,6 +311,11 @@ def write_design_output(request, pool, ranked):
         handle.write("- Tolerance: %.12g %%\n" % float(request.FREQUENCY_TOLERANCE_PERCENT))
         handle.write("- Raw tolerance-qualified all-mode candidates: %d\n" % len(pool))
         handle.write("- Data library: %s\n" % library)
+        if bool(getattr(request, "USE_ABH_SHELL_SIZE_FILTER", False)):
+            x_bounds = tuple(getattr(request, "ABH_SHELL_OVERALL_LENGTH_X_MM_RANGE"))
+            y_bounds = tuple(getattr(request, "ABH_SHELL_OVERALL_WIDTH_Y_MM_RANGE"))
+            handle.write("- ABH shell outer-envelope constraint: X = %.12g--%.12g mm; Y = %.12g--%.12g mm. Damping and constrained layers are excluded.\n" %
+                         (x_bounds[0], x_bounds[1], y_bounds[0], y_bounds[1]))
         if ranked and ranked[0]["Effective_Modal_Mass_Z"] is None:
             handle.write("- Ranking preference: lowest frequency detuning (source data has no effective modal mass or mass fields).\n")
         else:

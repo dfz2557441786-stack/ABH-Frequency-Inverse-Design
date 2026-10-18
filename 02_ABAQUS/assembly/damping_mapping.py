@@ -25,6 +25,20 @@ def calculate_envelope(parameters):
             "abh_length_down": down, "L_all": length, "W_all": width}
 
 
+def shell_outer_dimensions(parameters):
+    """Return the real V2 ABH-shell XY outer-envelope dimensions in metres.
+
+    ``L_all`` and ``W_all`` are calculated from the same geometric quantities
+    used by the verified Shell_create model.  They describe the aluminium ABH
+    shell only: the damping and constrained layers are deliberately excluded.
+    """
+    envelope = calculate_envelope(parameters)
+    return {
+        "ABH_Shell_Overall_Length_X_m": envelope["L_all"],
+        "ABH_Shell_Overall_Width_Y_m": envelope["W_all"],
+    }
+
+
 def map_damping_dimensions(parameters, equality_tolerance=1.0e-10):
     envelope = calculate_envelope(parameters)
     inset_x = (envelope["L_all"] - parameters["damp_length"]) / 2.0

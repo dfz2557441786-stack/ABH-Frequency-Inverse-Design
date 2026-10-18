@@ -3,6 +3,7 @@ from __future__ import print_function
 
 import json
 import argparse
+import csv
 
 import project_bootstrap
 
@@ -12,11 +13,32 @@ import design_request
 from target_retrieval import rank_candidates, retrieve, write_design_output
 
 
+def _shell_size_bounds_from_request():
+    """Pass the user-edited shell-envelope limits to generation functions."""
+    if not bool(getattr(design_request, "USE_ABH_SHELL_SIZE_FILTER", False)):
+        return None
+    return {
+        "length_x_mm": tuple(getattr(design_request, "ABH_SHELL_OVERALL_LENGTH_X_MM_RANGE")),
+        "width_y_mm": tuple(getattr(design_request, "ABH_SHELL_OVERALL_WIDTH_Y_MM_RANGE")),
+    }
+
+
 def main(design_mode=None):
     # 日常使用只需修改 ``00_USER_DESIGN/design_request.py``，然后运行本文件。
     # 默认 RETRIEVAL 仅查询数据库，不会提交 Abaqus 作业。
     # 模型检查始终为零 Abaqus 模式，优先于任何历史验证开关。
     design_mode = design_mode or getattr(design_request, "DESIGN_MODE", "RETRIEVAL")
+    # 远距离探索始终只生成参数，任何验证开关都不能在此入口提交作业。
+    if design_mode == "GENERATE_FAR":
+        if design_request.DATA_LIBRARY != "FIXED_BAND_15MM_V2":
+            raise ValueError("FAR_SEARCH_REQUIRES_FIXED_BAND_15MM_V2")
+        from frequency_generation import run_fixed_band_far_generation
+        return run_fixed_band_far_generation(
+            design_request.TARGET_FREQUENCY_HZ,
+            design_request.GENERATIVE_ADDITIONAL_TARGETS_HZ,
+            design_request.FIXED_BAND_DATASET_CSV,
+            design_request.FAR_SEARCH_POLICY,
+            _shell_size_bounds_from_request())
     if design_mode in ("MODEL_CHECK", "ANCHOR_CHECK"):
         if getattr(design_request, "DATA_LIBRARY", "") != "FIXED_BAND_15MM_V2":
             raise ValueError("MODEL_CHECK_REQUIRES_FIXED_BAND_15MM_V2")
@@ -29,7 +51,16 @@ def main(design_mode=None):
         )
     # 批量验证优先于单候选验证：候选 ID 由用户配置文件显式指定，按顺序串行提交。
     if getattr(design_request, "VALIDATE_BATCH_NEW_CANDIDATES", False):
-        batch_ids = tuple(getattr(design_request, "BATCH_CANDIDATE_IDS", ()))
+        candidate_csv = getattr(design_request, "BATCH_VALIDATION_CANDIDATE_CSV", "").strip() or None
+        if getattr(design_request, "VALIDATE_ALL_CANDIDATES_FROM_CSV", False):
+            if not candidate_csv:
+                raise ValueError("BATCH_VALIDATION_CANDIDATE_CSV_REQUIRED_FOR_VALIDATE_ALL")
+            with open(candidate_csv, newline="", encoding="utf-8-sig") as stream:
+                batch_ids = tuple(str(row.get("Candidate_ID", "")).strip()
+                                  for row in csv.DictReader(stream)
+                                  if str(row.get("Candidate_ID", "")).strip())
+        else:
+            batch_ids = tuple(getattr(design_request, "BATCH_CANDIDATE_IDS", ()))
         if not batch_ids:
             raise ValueError("BATCH_CANDIDATE_IDS_REQUIRED")
         if getattr(design_request, "VALIDATE_ONE_NEW_CANDIDATE", False):
@@ -39,7 +70,7 @@ def main(design_mode=None):
         from frequency_generation import validate_fixed_band_saved_candidates_batch
         return validate_fixed_band_saved_candidates_batch(
             batch_ids,
-            getattr(design_request, "BATCH_VALIDATION_CANDIDATE_CSV", "").strip() or None,
+            candidate_csv,
             bool(getattr(design_request, "BATCH_RETRY_PREVIOUSLY_ATTEMPTED", False)),
         )
     # 单候选验证只允许提交用户指定的一组新 ABH。
@@ -62,6 +93,7 @@ def main(design_mode=None):
                 design_mode, design_request.TARGET_FREQUENCY_HZ,
                 design_request.GENERATIVE_ADDITIONAL_TARGETS_HZ,
                 getattr(design_request, "FIXED_BAND_DATASET_CSV", ""),
+                _shell_size_bounds_from_request(),
             )
         return run_frequency_design(design_mode, design_request.TARGET_FREQUENCY_HZ,
                                     design_request.GENERATIVE_ADDITIONAL_TARGETS_HZ)
@@ -91,6 +123,6 @@ def main(design_mode=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--design-mode", choices=("RETRIEVAL","GENERATE","MODEL_CHECK","ANCHOR_CHECK","VALIDATE","GENERATE_AND_VALIDATE"))
+    parser.add_argument("--design-mode", choices=("RETRIEVAL","GENERATE","GENERATE_FAR","MODEL_CHECK","ANCHOR_CHECK","VALIDATE","GENERATE_AND_VALIDATE"))
     args = parser.parse_args()
     main(args.design_mode)
