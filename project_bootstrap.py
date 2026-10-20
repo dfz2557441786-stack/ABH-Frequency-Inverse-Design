@@ -14,7 +14,7 @@ MODULE_DIRECTORIES = (
     os.path.join("02_ABAQUS", "analysis"),
     "03_DATABASE",
     "04_INVERSE_DESIGN",
-    # 05_VALIDATION 的旧 Host 耦合验证已移除；不再加入正式导入路径。
+    "05_VALIDATION",
     "06_POSTPROCESS",
 )
 

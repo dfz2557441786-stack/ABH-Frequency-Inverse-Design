@@ -113,6 +113,41 @@ class _FixedBandSpectrumGPR(object):
         return mean, std
 
 
+class _FixedBandSpectrumExtraTrees(object):
+    """Bounded-cost spectrum surrogate used only by ``GENERATE_FAR``.
+
+    A 24-output GPR on thousands of geometries is appropriate for an offline
+    model study but is too slow for an interactive constrained exploration.
+    This ensemble predicts the same sorted spectrum and exposes the spread
+    across trees as a *screening* indicator.  That spread is deliberately not
+    labelled a calibrated probability interval; every far candidate still
+    requires independent Abaqus validation.
+    """
+
+    def __init__(self, n_estimators=240, min_samples_leaf=1):
+        self.n_estimators = int(n_estimators)
+        self.min_samples_leaf = int(min_samples_leaf)
+
+    def fit(self, x, y):
+        self.model = ExtraTreesRegressor(
+            n_estimators=self.n_estimators,
+            min_samples_leaf=self.min_samples_leaf,
+            max_features=1.0,
+            n_jobs=1,
+            random_state=20261018,
+        ).fit(np.asarray(x), np.asarray(y))
+        return self
+
+    def predict(self, x):
+        vectors = np.atleast_2d(x)
+        individual = np.asarray([tree.predict(vectors)
+                                 for tree in self.model.estimators_])
+        # ``ExtraTreesRegressor`` keeps multi-output predictions in the final
+        # axis.  The per-tree dispersion is only a ranking/UQ screen.
+        return (np.mean(individual, axis=0),
+                np.maximum(np.std(individual, axis=0), 1.0e-9))
+
+
 class _FixedBandAnchorDelta(object):
     """真实锚点频率 + GPR预测增量；只使用训练集锚点，不进行模态身份假设。"""
 
@@ -199,6 +234,24 @@ def _fixed_band_fit_cached(directory, name, x, y, policy):
     payload = {"model": model, "seconds": time.perf_counter() - start,
                "warnings": sorted(set(str(w.message) for w in captured)),
                "kernel": str(model.model.kernel_)}
+    with open(path + ".pending", "wb") as stream:
+        pickle.dump(payload, stream)
+    os.replace(path + ".pending", path)
+    return payload
+
+
+def _fixed_band_fit_fast_cached(directory, name, x, y):
+    """Cache the deterministic bounded-cost far-search surrogate only."""
+    path = os.path.join(directory, name + ".pkl")
+    if os.path.isfile(path):
+        with open(path, "rb") as stream:
+            return pickle.load(stream)
+    print("FAR_SEARCH_TRAINING " + name, flush=True)
+    start = time.perf_counter()
+    with threadpool_limits(limits=1):
+        model = _FixedBandSpectrumExtraTrees().fit(x, y)
+    payload = {"model": model, "seconds": time.perf_counter() - start,
+               "warnings": [], "model_type": "EXTRATREES_SPECTRUM_SCREENING"}
     with open(path + ".pending", "wb") as stream:
         pickle.dump(payload, stream)
     os.replace(path + ".pending", path)
@@ -957,6 +1010,166 @@ def _fixed_band_validated_candidate_ids(output_dir):
                 str(row.get("Status", "")).strip() == "SUCCESS"}
 
 
+def _fixed_band_size_constrained_global_fallback(target, model, rows, x, lower,
+                                                  span, tree, policy, rng,
+                                                  shell_size_bounds_mm,
+                                                  candidate_prefix="FB15SIZE_",
+                                                  search_method="SIZE_CONSTRAINED_GLOBAL_FAR_FALLBACK",
+                                                  seed_feasible_sampling=False):
+    """Generate diverse candidates by directly sampling the 9D design space.
+
+    The historical caller uses this as a size-constrained far-search fallback.
+    The direct-global inverse-design entry point also uses the same physical
+    checks and diversity rule, but it never supplies an anchor.  In both cases
+    it is an exploratory FE-required screen rather than a frequency guarantee.
+    """
+    count = max(int(policy["proposal_count"]) * 20, 30000)
+    q = rng.uniform(0.0, 1.0, size=(count, x.shape[1]))
+    size_feasible_seed_count = 0
+    if seed_feasible_sampling:
+        # This is not frequency-anchor optimization.  It merely samples the
+        # narrow size/geometry-feasible manifold efficiently: a uniform 9D box
+        # wastes almost all proposals when an outer-shell envelope is tight.
+        # Every final point still has to be far from *all* training geometry.
+        seed_indices = [index for index, vector in enumerate(x)
+                        if _fixed_band_geometry_valid(
+                            vector, lower, lower + span,
+                            shell_size_bounds_mm)[0]]
+        size_feasible_seed_count = len(seed_indices)
+        if seed_indices:
+            normalized_seeds = (x[seed_indices] - lower) / span
+            selected = normalized_seeds[rng.randint(0, len(normalized_seeds), size=count)]
+            direction = rng.normal(size=(count, x.shape[1]))
+            direction /= np.maximum(np.linalg.norm(direction, axis=1)[:, None], 1.0e-12)
+            # A broad shell around geometry-feasible seeds explores the full
+            # allowed manifold without choosing seeds by target frequency.
+            radius = rng.uniform(policy["minimum_database_distance"] * 1.05, 0.55, count)
+            seeded = selected + direction * radius[:, None]
+            q = np.vstack((q, seeded[np.all((seeded >= 0.0) & (seeded <= 1.0), axis=1)]))
+    far_distance, nearest = tree.query(q)
+    q, nearest, far_distance = (q[far_distance >= policy["minimum_database_distance"]],
+                                nearest[far_distance >= policy["minimum_database_distance"]],
+                                far_distance[far_distance >= policy["minimum_database_distance"]])
+    feasible_q, feasible_nearest, feasible_distance, feasible_damping = [], [], [], []
+    for position, near, distance in zip(q, nearest, far_distance):
+        valid, _, damping = _fixed_band_geometry_valid(
+            lower + position * span, lower, lower + span, shell_size_bounds_mm)
+        if valid:
+            feasible_q.append(position)
+            feasible_nearest.append(int(near))
+            feasible_distance.append(float(distance))
+            feasible_damping.append(damping)
+    diagnostic = {
+        "Target_Frequency_Hz": float(target),
+        "Search_Method": search_method,
+        "Size_First_Random_Proposals": count,
+        "Geometry_Feasible_Seed_Count": size_feasible_seed_count,
+        "Proposal_Sampling": ("UNIFORM_PLUS_GEOMETRY_FEASIBLE_SEEDS"
+                              if seed_feasible_sampling else "UNIFORM_ONLY"),
+        "Size_Feasible_Far_Proposals": len(feasible_q),
+        "Optimization_Attempts": 0,
+        "Optimizer_Failed": 0,
+        "Constraint_Rejected": 0,
+        "Prediction_Rejected": 0,
+    }
+    if not feasible_q:
+        return [], [], diagnostic
+    q = np.asarray(feasible_q)
+    vectors = lower + q * span
+    means, stds = model.predict(vectors)
+    modes = np.argmin(abs(means - target), axis=1)
+    errors = abs(means[np.arange(len(means)), modes] - target) / target * 100.0
+    uncertainty = stds[np.arange(len(stds)), modes] / target * 100.0
+    diagnostic["Minimum_Predicted_Error_Percent"] = float(np.min(errors))
+    diagnostic["Minimum_Prediction_STD_Percent"] = float(np.min(uncertainty))
+    diagnostic["Best_Error_Candidate_STD_Percent"] = float(uncertainty[int(np.argmin(errors))])
+    development_error_limit = max(5.0, float(policy["prediction_tolerance_percent"]))
+    diagnostic["Strict_UQ_Pass_Count"] = int(np.sum(
+        (errors <= policy["prediction_tolerance_percent"]) &
+        (uncertainty <= policy["maximum_prediction_std_percent"])))
+    diagnostic["Development_Probe_Error_Limit_Percent"] = development_error_limit
+    # A strict-UQ point must never be displaced merely because an explicitly
+    # high-UQ development probe has a slightly smaller mean detuning.
+    strict_mask = ((errors <= policy["prediction_tolerance_percent"]) &
+                   (uncertainty <= policy["maximum_prediction_std_percent"]))
+    order = np.lexsort((uncertainty, errors, ~strict_mask))
+    selected, selected_positions, differences = [], [], []
+    for index in order:
+        # A new size box can be wholly outside the calibrated-UQ domain.  Do
+        # not suppress all useful development points in that case: retain a
+        # separate, explicitly high-UQ probe tier when its *predicted* target
+        # error remains within 5%.  It is never called frequency-qualified
+        # until an independent Abaqus modal run confirms it.
+        if errors[index] > development_error_limit:
+            diagnostic["Prediction_Rejected"] += 1
+            continue
+        strict_uq = bool(strict_mask[index])
+        tier = "STRICT_DIRECT_GLOBAL_SCREEN" if strict_uq else "HIGH_UQ_DEVELOPMENT_PROBE"
+        position = q[index]
+        if any(np.linalg.norm(position - previous) < policy["minimum_pair_distance"]
+               for previous in selected_positions):
+            continue
+        near = feasible_nearest[index]
+        damping = feasible_damping[index]
+        parameters = dict(zip(FIXED_BAND_9D, map(float, vectors[index])))
+        candidate = dict(parameters)
+        candidate.update({
+            "Candidate_ID": candidate_prefix + hashlib.sha256(
+                json.dumps(parameters, sort_keys=True).encode()).hexdigest()[:12],
+            "Target_Frequency_Hz": float(target),
+            "Predicted_Mode_Index": int(modes[index]) + 1,
+            "Predicted_Frequency_Hz": float(means[index, modes[index]]),
+            "Predicted_STD_Hz": float(stds[index, modes[index]]),
+            "Predicted_Error_Percent": float(errors[index]),
+            "Prediction_STD_Percent": float(uncertainty[index]),
+            "Nearest_Training_Distance": float(feasible_distance[index]),
+            "Nearest_Database_Sample_ID": rows[near]["Sample_ID"],
+            "Anchor_Distance": None,
+            "Geometry_Valid": True,
+            "Geometry_Check_Level": "ALGEBRAIC_ONLY_NOT_MESH_OR_FE",
+            "New_Geometry": True,
+            "Data_Library": FIXED_BAND_LIBRARY,
+            "Damping_Inward_X_m": 0.015,
+            "Damping_Inward_Y_m": 0.015,
+            "rx_for_v2_builder": damping["rx"],
+            "ry_for_v2_builder": damping["ry"],
+            "ABH_Shell_Overall_Length_X_m": damping["ABH_Shell_Overall_Length_X_m"],
+            "ABH_Shell_Overall_Width_Y_m": damping["ABH_Shell_Overall_Width_Y_m"],
+            "Damping_Configuration": damping["Damping_Configuration"],
+            "Prediction_Status": (
+                "DIRECT_GLOBAL_STRICT_SCREEN_REQUIRES_ABAQUS" if strict_uq else
+                "DIRECT_GLOBAL_HIGH_UQ_DEVELOPMENT_PROBE_REQUIRES_ABAQUS"),
+            "Search_Method": search_method,
+            "Selection_Tier": tier,
+            "Physical_Mode_Identity": "UNCONFIRMED",
+            "Abaqus_Validated": False,
+            "Uncertainty_Calibration_Status": "EXTRATREES_SPREAD_NOT_CALIBRATED_95_PERCENT_INTERVAL",
+            "Spectrum_Inversion": bool(np.any(np.diff(means[index]) < 0)),
+            "Boundary_Margin_Normalized": float(np.min(np.minimum(position, 1 - position))),
+        })
+        selected.append(candidate)
+        selected_positions.append(position)
+        for j, key in enumerate(FIXED_BAND_9D):
+            scale, unit = (180 / math.pi, "deg") if key == "theta" else ((1., "dimensionless") if key == "power_law" else (1000., "mm"))
+            differences.append({"Candidate_ID": candidate["Candidate_ID"],
+                "Target_Frequency_Hz": float(target),
+                "Nearest_Database_Sample_ID": rows[near]["Sample_ID"],
+                "Parameter": key, "Unit": unit,
+                "Candidate_Value": candidate[key] * scale,
+                "Database_Value": float(x[near, j]) * scale,
+                "Difference": (candidate[key] - float(x[near, j])) * scale,
+                "Difference_Fraction_of_Database_Range":
+                    (candidate[key] - float(x[near, j])) / span[j]})
+        if len(selected) >= int(policy["candidate_count"]):
+            break
+    diagnostic["Selected_Candidates"] = len(selected)
+    diagnostic["Strict_Selected_Candidates"] = len(
+        [item for item in selected if item["Selection_Tier"] == "STRICT_DIRECT_GLOBAL_SCREEN"])
+    diagnostic["High_UQ_Development_Probe_Count"] = len(
+        [item for item in selected if item["Selection_Tier"] == "HIGH_UQ_DEVELOPMENT_PROBE"])
+    return selected, differences, diagnostic
+
+
 def _fixed_band_far_target(target, model, rows, x, y, policy, seed,
                            shell_size_bounds_mm=None):
     """远距离探索：全库排斥距离 + 有界锚点邻域；不是已验证可信域。"""
@@ -987,11 +1200,17 @@ def _fixed_band_far_target(target, model, rows, x, y, policy, seed,
                   "Algebraically_Feasible_Far_Proposals": len(proposals), "Optimization_Attempts": 0,
                   "Optimizer_Failed": 0, "Constraint_Rejected": 0, "Prediction_Rejected": 0}
     if not len(proposals):
+        if shell_size_bounds_mm is not None:
+            return _fixed_band_size_constrained_global_fallback(
+                target, model, rows, x, lower, span, tree, policy, rng,
+                shell_size_bounds_mm)
         return [], [], diagnostic
 
     def mean_only(vectors):
-        scaled = model.input_scaler.transform(np.atleast_2d(vectors))
-        return model.output_scaler.inverse_transform(model.model.predict(scaled))
+        # Far-search accepts either the experimental GPR or the bounded-cost
+        # ExtraTrees spectrum screen.  Both public ``predict`` methods take
+        # raw 9D vectors and return (mean_spectrum, uncertainty_screen).
+        return model.predict(np.atleast_2d(vectors))[0]
 
     with threadpool_limits(limits=1):
         means = np.concatenate([mean_only(lower + proposals[i:i+128] * span)
@@ -1097,12 +1316,12 @@ def run_fixed_band_far_generation(target, additional, dataset_csv, policy,
         if not np.isfinite(policy[key]) or policy[key] <= 0:
             raise ValueError("INVALID_FAR_SEARCH_THRESHOLD:" + key)
     rows, x, y = _fixed_band_training_data(dataset_csv)
-    identity = hashlib.sha256(x.tobytes() + y.tobytes() + str(policy["training_maxiter"]).encode() + b"FAR_V1").hexdigest()
+    identity = hashlib.sha256(x.tobytes() + y.tobytes() + b"FAR_EXTRATREES_V2").hexdigest()
     root = ensure_directory(os.path.join(BASE_OUTPUT, "fixed_band_15mm", "far_generated"))
     output = ensure_directory(os.path.join(root, datetime.now().strftime("%Y%m%d_%H%M%S_%f")))
     cache = ensure_directory(os.path.join(root, "model_cache", identity[:16]))
-    print("FAR_SEARCH_TRAIN_OR_LOAD geometries=%d; ABAQUS=DISABLED" % len(rows), flush=True)
-    fitted = _fixed_band_fit_cached(cache, "experimental_spectrum", x, y, {"optimizer_maxiter": policy["training_maxiter"]})
+    print("FAR_SEARCH_TRAIN_OR_LOAD geometries=%d; model=EXTRATREES; ABAQUS=DISABLED" % len(rows), flush=True)
+    fitted = _fixed_band_fit_fast_cached(cache, "far_spectrum_extratrees", x, y)
     candidates, differences, diagnostics = [], [], []
     for i, frequency in enumerate(targets):
         print("FAR_SEARCH_START target=%g" % frequency, flush=True)
@@ -1120,9 +1339,88 @@ def run_fixed_band_far_generation(target, additional, dataset_csv, policy,
                "Diagnostics": diagnostics, "Candidate_Count": len(candidates), "Output_Directory": output,
                "ABH_Shell_Size_Constraint_mm": shell_size_bounds_mm,
                "User_Prediction_Table": user_prediction_path,
+               "Surrogate_For_Far_Exploration": fitted.get("model_type", "EXTRATREES_SPECTRUM_SCREENING"),
                "Model_Training_Warnings": fitted["warnings"],
                "Distance_Normalization": {k: {"min": float(x[:,j].min()), "max": float(x[:,j].max())} for j,k in enumerate(FIXED_BAND_9D)}}
     save_json(os.path.join(output, "run_manifest.json"), summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    return summary
+
+
+def run_fixed_band_direct_global_generation(target, additional, dataset_csv, policy,
+                                             shell_size_bounds_mm=None):
+    """Generate diverse database-external geometries without target anchors.
+
+    The design objective is explicitly the nearest predicted mode to each
+    requested frequency, not a fixed sorted modal branch.  This matches the
+    current research definition: a candidate is useful when *some* isolated
+    ABH mode lies near the target.  It does not claim physical mode identity,
+    calibrated uncertainty, or Abaqus validation.
+    """
+    targets = list(dict.fromkeys([float(target)] + list(map(float, additional))))
+    if any(not np.isfinite(value) or value <= 0.0 for value in targets):
+        raise ValueError("INVALID_TARGET_FREQUENCY")
+    for key in ("candidate_count", "proposal_count"):
+        if int(policy[key]) <= 0:
+            raise ValueError("INVALID_DIRECT_GLOBAL_POLICY:" + key)
+    if not 0.0 < float(policy["minimum_database_distance"]):
+        raise ValueError("INVALID_DIRECT_GLOBAL_MINIMUM_DATABASE_DISTANCE")
+
+    rows, x, y = _fixed_band_training_data(dataset_csv)
+    lower, span = x.min(axis=0), np.ptp(x, axis=0)
+    if np.any(span <= 0.0):
+        raise RuntimeError("DEGENERATE_GEOMETRY_RANGE")
+    normalized = (x - lower) / span
+    tree = cKDTree(normalized)
+    identity = hashlib.sha256(x.tobytes() + y.tobytes() + b"DIRECT_GLOBAL_EXTRATREES_V1").hexdigest()
+    root = ensure_directory(os.path.join(BASE_OUTPUT, "fixed_band_15mm", "direct_global"))
+    output = ensure_directory(os.path.join(root, datetime.now().strftime("%Y%m%d_%H%M%S_%f")))
+    cache = ensure_directory(os.path.join(root, "model_cache", identity[:16]))
+    print("DIRECT_GLOBAL_TRAIN_OR_LOAD geometries=%d; model=EXTRATREES; anchors=DISABLED; ABAQUS=DISABLED" % len(rows), flush=True)
+    fitted = _fixed_band_fit_fast_cached(cache, "direct_global_spectrum_extratrees", x, y)
+
+    candidates, differences, diagnostics = [], [], []
+    for index, frequency in enumerate(targets):
+        print("DIRECT_GLOBAL_SEARCH_START target=%g" % frequency, flush=True)
+        rng = np.random.RandomState(int(policy["seed"]) + 10000 + index)
+        found, delta, diagnostic = _fixed_band_size_constrained_global_fallback(
+            frequency, fitted["model"], rows, x, lower, span, tree, policy, rng,
+            shell_size_bounds_mm,
+            candidate_prefix="FB15DIR_",
+            search_method="DIRECT_GLOBAL_MULTI_SOLUTION_SCREEN",
+            seed_feasible_sampling=True,
+        )
+        diagnostic["Anchor_Required"] = False
+        candidates.extend(found)
+        differences.extend(delta)
+        diagnostics.append(diagnostic)
+        # Each target is durable if a long multi-target search is interrupted.
+        write_csv(os.path.join(output, "direct_global_candidates.csv"), candidates)
+        write_csv(os.path.join(output, "nearest_geometry_differences.csv"), differences)
+        print(json.dumps(diagnostic, ensure_ascii=False), flush=True)
+
+    user_prediction_path = write_fixed_band_user_prediction_table(candidates, "GENERATE_DIRECT")
+    summary = {
+        "Status": ("DIRECT_GLOBAL_CANDIDATES_REQUIRE_ABAQUS_VALIDATION" if candidates
+                   else "NO_DIRECT_GLOBAL_CANDIDATES"),
+        "Abaqus_Job_Submitted": False,
+        "Training_Geometries": len(rows),
+        "Targets": targets,
+        "Candidate_Count": len(candidates),
+        "Output_Directory": output,
+        "Candidates_Output": os.path.join(output, "direct_global_candidates.csv"),
+        "Nearest_Geometry_Differences_Output": os.path.join(output, "nearest_geometry_differences.csv"),
+        "User_Prediction_Table": user_prediction_path,
+        "Search_Method": "DIRECT_GLOBAL_MULTI_SOLUTION_SCREEN",
+        "Anchor_Required": False,
+        "Surrogate": fitted.get("model_type", "EXTRATREES_SPECTRUM_SCREENING"),
+        "Uncertainty_Limitations": "Per-tree spread is not a calibrated probability interval.",
+        "Physical_Mode_Identity": "UNCONFIRMED",
+        "Diagnostics": diagnostics,
+        "ABH_Shell_Size_Constraint_mm": shell_size_bounds_mm,
+        "Data_Array_SHA256": identity,
+    }
+    save_json(os.path.join(output, "direct_global_generation_summary.json"), summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     return summary
 
@@ -1325,6 +1623,397 @@ def write_fixed_band_frequency_qualified_pool(validation_rows, candidate_ids=Non
     return {"Frequency_Qualified_Pool": pool_path,
             "Frequency_Qualified_Pool_Report": report_path,
             "Frequency_Qualified_Count": len(pool)}
+
+
+def build_fixed_band_validation_feedback(ledger_path=None):
+    """整理已完成的独立 FE 验证，但绝不把不完整频谱写回主训练库。
+
+    当前批量验证台账只保存每个候选相对于其目标频率的最近实际模态，不能
+    可靠地重建 24 阶完整频谱。因此这里输出的是可追溯的 *反馈库*：通过点
+    可供后续耦合筛选，未通过但求解成功的点可供局部校准/补样决策；两者都
+    不会静默污染 ``FIXED_BAND_DATASET_CSV``。
+    """
+    output_dir = ensure_directory(os.path.join(BASE_OUTPUT, "fixed_band_15mm",
+                                                 "validation_feedback"))
+    ledger_path = ledger_path or os.path.join(
+        BASE_OUTPUT, "fixed_band_15mm", "generated",
+        "fixed_band_15mm_abaqus_validation.csv")
+    if not os.path.isfile(ledger_path):
+        raise RuntimeError("VALIDATION_LEDGER_MISSING:%s" % ledger_path)
+    with open(ledger_path, newline="", encoding="utf-8-sig") as stream:
+        source = list(csv.DictReader(stream))
+
+    def number(row, key):
+        try:
+            value = float(row.get(key, ""))
+            return value if math.isfinite(value) else None
+        except (TypeError, ValueError):
+            return None
+
+    def passed(row):
+        return str(row.get("Frequency_Match_PASS", "")).strip().lower() in (
+            "true", "1", "yes")
+
+    def complete_spectrum(row):
+        """Return a validated stored spectrum, or ``None`` for legacy rows."""
+        encoded = str(row.get("All_Positive_Frequencies_Hz_JSON", "")).strip()
+        if not encoded:
+            return None
+        try:
+            values = [float(value) for value in json.loads(encoded)]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if (len(values) < 24 or not all(math.isfinite(value) and value > 0 for value in values)
+                or any(b < a for a, b in zip(values[:-1], values[1:]))):
+            return None
+        return values
+
+    feedback = []
+    successful = []
+    complete_spectrum_count = 0
+    for raw in source:
+        row = dict(raw)
+        is_success = str(row.get("Status", "")).upper() == "SUCCESS"
+        has_frequency = number(row, "Abaqus_Frequency_Hz") is not None
+        if is_success and has_frequency:
+            successful.append(row)
+            if passed(row):
+                row["Feedback_Use"] = "FREQUENCY_QUALIFIED_CANDIDATE"
+                row["Recommended_Next_Action"] = (
+                    "PRESERVE_FOR_COUPLED_SCREENING_OR_VALIDATED_DESIGN_BANK")
+            else:
+                row["Feedback_Use"] = "FEEDBACK_ONLY_NOT_FREQUENCY_QUALIFIED"
+                row["Recommended_Next_Action"] = (
+                    "KEEP_FOR_LOCAL_CALIBRATION_AND_FUTURE_FULL_SPECTRUM_REEXTRACTION")
+            spectrum = complete_spectrum(row)
+            if spectrum is None:
+                # Do not claim that one nearest frequency is a 24-mode training sample.
+                row["Full_Spectrum_Eligible_For_Base_Training"] = "NO"
+                row["Full_Spectrum_Reason"] = (
+                    "VALIDATION_LEDGER_CONTAINS_NEAREST_TARGET_MODE_ONLY")
+            else:
+                row["Full_Spectrum_Eligible_For_Base_Training"] = "YES"
+                row["Full_Spectrum_Reason"] = "STORED_24_MODE_SPECTRUM_AVAILABLE"
+                complete_spectrum_count += 1
+        else:
+            row["Feedback_Use"] = "NOT_USABLE_UNTIL_FAILURE_IS_RESOLVED"
+            row["Recommended_Next_Action"] = "KEEP_DIAGNOSTIC_EVIDENCE"
+            row["Full_Spectrum_Eligible_For_Base_Training"] = "NO"
+            row["Full_Spectrum_Reason"] = "NO_VALID_FE_NEAREST_FREQUENCY"
+        feedback.append(row)
+
+    feedback_path = os.path.join(output_dir, "validated_fe_feedback.csv")
+    write_csv(feedback_path, feedback)
+    qualified = write_fixed_band_frequency_qualified_pool(successful)
+
+    grouped = {}
+    for row in successful:
+        target = number(row, "Target_Frequency_Hz")
+        if target is None:
+            continue
+        group = grouped.setdefault(target, [])
+        group.append(row)
+    summary_rows = []
+    for target in sorted(grouped):
+        group = grouped[target]
+        errors = sorted(value for value in
+                        (number(row, "Frequency_Error_Percent") for row in group)
+                        if value is not None)
+        summary_rows.append({
+            "Target_Frequency_Hz": target,
+            "FE_Solver_Success_Count": len(group),
+            "Frequency_Match_Pass_Count": sum(1 for row in group if passed(row)),
+            "Frequency_Match_Pass_Rate_Percent": (
+                100.0 * sum(1 for row in group if passed(row)) / len(group)),
+            "Median_Actual_Error_Percent": (
+                errors[(len(errors) - 1) // 2] if errors else ""),
+            "Max_Actual_Error_Percent": max(errors) if errors else "",
+        })
+    by_target_path = os.path.join(output_dir, "validation_feedback_by_target.csv")
+    write_csv(by_target_path, summary_rows)
+
+    passed_count = sum(1 for row in successful if passed(row))
+    report_path = os.path.join(output_dir, "VALIDATION_FEEDBACK_SUMMARY.md")
+    lines = [
+        "# 固定 15 mm 阻尼带：真实 FE 验证反馈汇总",
+        "",
+        "## 结论边界",
+        "",
+        "- 本反馈库来自独立 Abaqus 求解后的最近目标频率，不是代理预测值。",
+        "- 本次不会自动修改主训练库；只有保存了完整 24 阶频谱的记录才可能在后续人工审核后追加。",
+        "- 未通过点仍保留为局部校准与后续完整频谱重提取的证据；不得删除。",
+        "",
+        "## 统计",
+        "",
+        "- 台账总行数：%d" % len(source),
+        "- 有效 FE 最近频率：%d" % len(successful),
+        "- 已保存完整 24 阶频谱：%d" % complete_spectrum_count,
+        "- ±2%% 频率通过：%d（%.2f%%）" % (
+            passed_count, 100.0 * passed_count / len(successful) if successful else 0.0),
+        "- 频率合格候选池：%s" % qualified["Frequency_Qualified_Pool"],
+        "- 分目标统计：%s" % by_target_path,
+        "",
+        "## 后续使用",
+        "",
+        "1. 频率通过点可以进入‘已验证设计库’，供尺寸、质量和后续耦合筛选。",
+        "2. 未通过但求解成功点不能丢弃；若需要提升完整谱代理模型，必须从其 ODB/DAT 重提取完整 0–500 Hz 前 24 阶后，再以新数据集版本追加。",
+        "3. 不要把本文件直接与原 24 阶样本库合并训练。",
+    ]
+    with open(report_path, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(lines) + "\n")
+    return {
+        "Status": "VALIDATION_FEEDBACK_BUILT",
+        "Validation_Ledger": ledger_path,
+        "Feedback_CSV": feedback_path,
+        "By_Target_CSV": by_target_path,
+        "Summary": report_path,
+        "FE_Solver_Success_Count": len(successful),
+        "Frequency_Match_Pass_Count": passed_count,
+        "Frequency_Match_Pass_Rate_Percent": (
+            100.0 * passed_count / len(successful) if successful else 0.0),
+        "Complete_24_Mode_Spectrum_Count": complete_spectrum_count,
+        "Base_Training_Dataset_Modified": False,
+    }
+
+
+def recover_fixed_band_validation_spectra(ledger_path=None):
+    """Read existing validation DAT files and recover their full solved spectra.
+
+    This is a read-only recovery step: it never starts Abaqus and never edits
+    the accepted 24-mode sample library.  A generated validation job currently
+    uses a 500 Hz eigenspectrum ceiling, therefore many candidates legitimately
+    have fewer than 24 modes.  Such rows remain useful evidence but are clearly
+    marked as ineligible for direct append to the 24-mode training dataset.
+    """
+    output_dir = ensure_directory(os.path.join(BASE_OUTPUT, "fixed_band_15mm",
+                                                 "validation_feedback"))
+    ledger_path = ledger_path or os.path.join(
+        BASE_OUTPUT, "fixed_band_15mm", "generated",
+        "fixed_band_15mm_abaqus_validation.csv")
+    if not os.path.isfile(ledger_path):
+        raise RuntimeError("VALIDATION_LEDGER_MISSING:%s" % ledger_path)
+    with open(ledger_path, newline="", encoding="utf-8-sig") as stream:
+        successful = [dict(row) for row in csv.DictReader(stream)
+                      if str(row.get("Status", "")).upper() == "SUCCESS"
+                      and str(row.get("Abaqus_Frequency_Hz", "")).strip()]
+    candidates = {str(row["Candidate_ID"]).strip(): row for row in successful}
+    if not candidates:
+        raise RuntimeError("NO_SUCCESSFUL_FIXED_BAND_VALIDATIONS")
+
+    # Search only the owned fixed-band validation root.  Never scan arbitrary
+    # E: content or infer files from another project.
+    owned_root = os.path.join(RUNS, "fixed_band_15mm_validation")
+    if not os.path.isdir(owned_root):
+        raise RuntimeError("VALIDATION_RUN_ROOT_MISSING:%s" % owned_root)
+    dat_by_candidate = {}
+    for root, unused_dirs, files in os.walk(owned_root):
+        for name in files:
+            if not name.lower().endswith(".dat"):
+                continue
+            full = os.path.join(root, name)
+            for candidate_id in candidates:
+                if candidate_id in full:
+                    prior = dat_by_candidate.get(candidate_id)
+                    if prior is None or os.path.getmtime(full) > os.path.getmtime(prior):
+                        dat_by_candidate[candidate_id] = full
+                    break
+
+    from modal_frequency_tools import parse_modal_dat
+    long_rows, index_rows = [], []
+    for candidate_id in sorted(candidates):
+        raw = candidates[candidate_id]
+        dat_path = dat_by_candidate.get(candidate_id, "")
+        parsed = parse_modal_dat(dat_path)
+        modes = [(mode, frequency) for mode, frequency in
+                 sorted(parsed.get("frequencies", {}).items())
+                 if math.isfinite(frequency) and frequency > 0.0 and frequency <= 500.00001]
+        eligible = len(modes) >= 24
+        index = {
+            "Candidate_ID": candidate_id,
+            "Target_Frequency_Hz": raw.get("Target_Frequency_Hz", ""),
+            "DAT_Path": dat_path,
+            "DAT_Found": bool(dat_path),
+            "Recovered_Positive_Mode_Count_0_500Hz": len(modes),
+            "Recovered_Highest_Frequency_Hz": max([frequency for unused_mode, frequency in modes], default=""),
+            "Complete_24_Mode_Eligible_For_Base_Training": eligible,
+            "Backfill_Status": ("COMPLETE_24_MODE_SPECTRUM_AVAILABLE" if eligible else
+                                "PARTIAL_0_500_SPECTRUM_ONLY" if modes else
+                                "DAT_NOT_FOUND_OR_NO_PARSEABLE_MODES"),
+        }
+        index_rows.append(index)
+        for mode, frequency in modes:
+            entry = {
+                "Candidate_ID": candidate_id,
+                "Target_Frequency_Hz": raw.get("Target_Frequency_Hz", ""),
+                "Mode_Index": mode,
+                "Frequency_Hz": frequency,
+                "Frequency_Source": "RECOVERED_EXISTING_DAT",
+                "DAT_Path": dat_path,
+                "Complete_24_Mode_Eligible_For_Base_Training": eligible,
+            }
+            for key in tuple(FIXED_BAND_9D) + ("Damping_Inward_X_m", "Damping_Inward_Y_m"):
+                entry[key] = raw.get(key, "")
+            long_rows.append(entry)
+
+    long_path = os.path.join(output_dir, "recovered_validation_modes_0_500_long.csv")
+    index_path = os.path.join(output_dir, "recovered_validation_spectrum_index.csv")
+    write_csv(long_path, long_rows)
+    write_csv(index_path, index_rows)
+    complete_count = sum(1 for row in index_rows
+                         if row["Complete_24_Mode_Eligible_For_Base_Training"])
+    report_path = os.path.join(output_dir, "VALIDATION_SPECTRUM_RECOVERY.md")
+    lines = [
+        "# 历史验证模态谱回收",
+        "",
+        "- 不提交 Abaqus；只读取本项目固定 15 mm 验证目录下已有 DAT。",
+        "- 成功验证候选：%d" % len(successful),
+        "- 找到可解析 DAT：%d" % sum(1 for row in index_rows if row["DAT_Found"]),
+        "- 回收 0–500 Hz 正频率总条数：%d" % len(long_rows),
+        "- 可直接追加到要求 24 阶完整谱主库的候选：%d" % complete_count,
+        "",
+        "当前验证 FrequencyStep 的 500 Hz 上限会使许多构型在该区间仅有约 7 阶模态。",
+        "这些部分谱不能伪装成 24 阶训练样本；可作为目标频率局部反馈数据保留。",
+        "若要扩充统一 24 阶样本库，后续新样本需按样本库的 24 阶输出定义求解，而不是只截断至 500 Hz。",
+    ]
+    with open(report_path, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(lines) + "\n")
+    return {
+        "Status": "VALIDATION_SPECTRUM_RECOVERY_COMPLETED",
+        "Validation_Ledger": ledger_path,
+        "Successful_Validation_Count": len(successful),
+        "DAT_Found_Count": sum(1 for row in index_rows if row["DAT_Found"]),
+        "Recovered_Mode_Row_Count": len(long_rows),
+        "Complete_24_Mode_Eligible_Count": complete_count,
+        "Recovered_Long_CSV": long_path,
+        "Spectrum_Index_CSV": index_path,
+        "Summary": report_path,
+        "Abaqus_Job_Submitted": False,
+        "Base_Training_Dataset_Modified": False,
+    }
+
+
+def append_complete_validation_spectra_to_fixed_band_dataset(dataset_csv):
+    """Create a versioned 24-mode dataset with eligible real-FE validations.
+
+    The source dataset is never overwritten.  Only recovered candidates with
+    all first 24 positive modes available are appended, whether or not their
+    original target-frequency attempt passed.  This prevents target-selection
+    bias from silently discarding useful negative examples.
+    """
+    if not dataset_csv or not os.path.isfile(dataset_csv):
+        raise RuntimeError("FIXED_BAND_15MM_DATASET_MISSING:%s" % dataset_csv)
+    recovery = recover_fixed_band_validation_spectra()
+    with open(recovery["Spectrum_Index_CSV"], newline="", encoding="utf-8-sig") as stream:
+        eligible_ids = {row["Candidate_ID"] for row in csv.DictReader(stream)
+                        if str(row.get("Complete_24_Mode_Eligible_For_Base_Training", "")).lower() == "true"}
+    if not eligible_ids:
+        raise RuntimeError("NO_COMPLETE_VALIDATION_SPECTRA_AVAILABLE")
+    with open(recovery["Recovered_Long_CSV"], newline="", encoding="utf-8-sig") as stream:
+        long_rows = list(csv.DictReader(stream))
+    spectra = {}
+    for row in long_rows:
+        candidate_id = row.get("Candidate_ID", "")
+        if candidate_id in eligible_ids:
+            spectra.setdefault(candidate_id, []).append((int(row["Mode_Index"]),
+                                                          float(row["Frequency_Hz"])))
+
+    ledger_path = recovery["Validation_Ledger"]
+    with open(ledger_path, newline="", encoding="utf-8-sig") as stream:
+        validation = {row["Candidate_ID"]: row for row in csv.DictReader(stream)
+                      if row.get("Candidate_ID") in eligible_ids}
+    with open(dataset_csv, newline="", encoding="utf-8-sig") as stream:
+        source_rows = list(csv.DictReader(stream))
+        fields = list(source_rows[0]) if source_rows else []
+    if not fields:
+        raise RuntimeError("EMPTY_FIXED_BAND_DATASET")
+
+    def geometry_key(row):
+        return tuple(round(float(row[key]), 12) for key in FIXED_BAND_9D)
+
+    known = {geometry_key(row) for row in source_rows}
+    appended, duplicates, rejected = [], [], []
+    for candidate_id in sorted(eligible_ids):
+        modes = sorted(spectra.get(candidate_id, []))
+        if len(modes) < 24 or [mode for mode, unused_frequency in modes[:24]] != list(range(1, 25)):
+            rejected.append({"Candidate_ID": candidate_id,
+                             "Reason": "RECOVERED_SPECTRUM_NOT_FIRST_24_CONSECUTIVE_MODES"})
+            continue
+        raw = validation.get(candidate_id)
+        if raw is None:
+            rejected.append({"Candidate_ID": candidate_id, "Reason": "VALIDATION_LEDGER_ROW_MISSING"})
+            continue
+        try:
+            key = geometry_key(raw)
+        except (TypeError, ValueError, KeyError):
+            rejected.append({"Candidate_ID": candidate_id, "Reason": "INVALID_9D_PARAMETERS"})
+            continue
+        if key in known:
+            duplicates.append({"Candidate_ID": candidate_id, "Reason": "DUPLICATE_9D_GEOMETRY_IN_BASE_DATASET"})
+            continue
+        record = dict((field, "") for field in fields)
+        record.update({
+            "sample_id": candidate_id,
+            "sampling_source": "FE_VALIDATION_BACKFILL_COMPLETE24_20261019",
+            "case": "DAMPED",
+            "boundary_mode": "CENTER_PLATFORM_FIXED",
+            "status": "MODAL_OK",
+            "job_status": "RECOVERED_EXISTING_VALIDATION_DAT",
+            "launcher_exit_code": "0",
+            "raw_mode_count": "24",
+            "elastic_mode_count": "24",
+            "scratch_cleaned": "FALSE",
+            # The base dataset stores physical 15 mm band inputs in rx/ry;
+            # derived V2 ratios remain in the validation ledger for provenance.
+            "rx": "0.015",
+            "ry": "0.015",
+        })
+        for parameter in FIXED_BAND_9D:
+            record[parameter] = raw[parameter]
+        for index, unused_pair in enumerate(modes[:24], 1):
+            frequency = unused_pair[1]
+            record["f_mode_%02d_hz" % index] = repr(frequency)
+            record["f_elastic_%02d_hz" % index] = repr(frequency)
+        appended.append(record)
+        known.add(key)
+
+    base_name, extension = os.path.splitext(os.path.basename(dataset_csv))
+    output_path = os.path.join(os.path.dirname(dataset_csv),
+                               base_name + "_plus_complete24_validation_backfill_20261019" + extension)
+    if os.path.exists(output_path):
+        raise RuntimeError("VERSIONED_BACKFILL_DATASET_ALREADY_EXISTS:%s" % output_path)
+    write_csv(output_path, source_rows + appended)
+    output_dir = ensure_directory(os.path.join(BASE_OUTPUT, "fixed_band_15mm",
+                                                 "validation_feedback"))
+    append_path = os.path.join(output_dir, "complete24_validation_backfill_rows.csv")
+    write_csv(append_path, appended)
+    rejected_path = os.path.join(output_dir, "complete24_validation_backfill_excluded.csv")
+    write_csv(rejected_path, duplicates + rejected)
+    report_path = os.path.join(output_dir, "COMPLETE24_VALIDATION_BACKFILL.md")
+    lines = [
+        "# 完整 24 阶真实验证谱回填",
+        "",
+        "- 原始训练库未改动：%s" % dataset_csv,
+        "- 新派生训练库：%s" % output_path,
+        "- 追加完整 24 阶真实 FE 构型：%d" % len(appended),
+        "- 与原库重复、未追加：%d" % len(duplicates),
+        "- 谱/参数不完整、未追加：%d" % len(rejected),
+        "- 所有追加点都来自已有 Abaqus DAT；本步骤未提交新作业。",
+        "- 这些点来源于先前的候选生成，属于真实但非独立随机采样；用于开发训练时仍须保留独立验证集。",
+    ]
+    with open(report_path, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(lines) + "\n")
+    return {
+        "Status": "COMPLETE24_VALIDATION_BACKFILL_COMPLETED",
+        "Original_Dataset": dataset_csv,
+        "Versioned_Dataset": output_path,
+        "Appended_Complete24_Validation_Geometries": len(appended),
+        "Duplicate_Geometries_Skipped": len(duplicates),
+        "Rejected_Records": len(rejected),
+        "Append_Rows_CSV": append_path,
+        "Excluded_Rows_CSV": rejected_path,
+        "Summary": report_path,
+        "Abaqus_Job_Submitted": False,
+    }
 
 
 def read_json(path):
@@ -1678,6 +2367,10 @@ def summarize_validation(candidate, result):
                     "Mode_Match_Status":"SAME_SORTED_MODE_NOT_PHYSICAL_ID" if branch==j else "NEAREST_MODE_DIFFERS_BRANCH_AMBIGUOUS",
                     "Frequency_Match_PASS":bool(abs(f[j]-target)/target*100<=POLICY["match_percent"]),
                     "Independent_Geometry_Validation":True,"Positive_Mode_Count":len(f),
+                    # Keep the complete extracted spectrum in the durable validation
+                    # ledger.  It is not auto-added to the base dataset; retaining it
+                    # merely makes a later reviewed backfill reproducible.
+                    "All_Positive_Frequencies_Hz_JSON":json.dumps([float(value) for value in f]),
                     "RABH_Assembly_Mass":result["masses"]["Total_Attachment_Mass"]})
         for field in ("Thickness_Field_Implementation","Geometry_Builder_Version","Section_Valid","Tie_Valid","BC_Valid","Mesh_Valid","ODB_Valid"):
             row[field]=result.get(field)
@@ -1785,6 +2478,157 @@ def validate_saved_candidate(candidate_id, candidate_csv=None):
     return result
 
 
+def _validate_far_fixed_band_candidate_staged(candidate, state, state_dir, run_root):
+    """Validate one far fixed-band candidate via BUILD -> solver -> EXTRACT.
+
+    This deliberately avoids the legacy ``run_frame(... submit_job=True)``
+    path, which keeps Abaqus/CAE resident while Standard is solving.  The
+    staged command mirrors the manually successful isolated-modal workflow:
+    CAE writes the accepted V2 input, exits, then an owned Standard process
+    solves that *same* input with one CPU, THREADS and ``memory=90%``.
+
+    It is intentionally private and used only for ``FB15SIZE_`` development
+    probes.  Existing production and historical validation paths remain
+    untouched.
+    """
+    sid = candidate["Candidate_ID"]
+    existing = state.setdefault("Jobs", {}).get(sid)
+    resume_inp_ready = False
+    if existing:
+        result_path = existing.get("Extract_Result_Path")
+        raw = read_json(result_path) if result_path else None
+        if raw and raw.get("Status") == "SUCCESS":
+            return summarize_validation(candidate, raw)
+        # The solver may have completed while a controller-side evidence path
+        # was wrong.  Re-extracting an existing fresh ODB is read-only and is
+        # explicitly not an Abaqus re-submission.
+        if existing.get("Status") == "SOLVER_COMPLETED":
+            request = existing["Request"]
+            folder = os.path.dirname(existing["Extract_Result_Path"])
+            extract_request = dict(
+                request, Stage="EXTRACT", Result_Path=existing["Extract_Result_Path"],
+                Build_Result=existing["Build_Result"],
+                ODB_Path=os.path.join(request["Run_Directory"], request["Job_Name"] + ".odb"),
+                Submitted_Epoch=existing.get("Submitted_Epoch"),
+                Solver_Log_Path=os.path.join(folder, "solver_console.log"),
+            )
+            raw = _staged_worker(extract_request, folder)
+            existing.update({"Status": raw.get("Status"), "Extract_Request": extract_request})
+            state.setdefault("Raw_Results", {})[sid] = raw
+            save_json(os.path.join(state_dir, "checkpoint.json"), state)
+            return summarize_validation(candidate, raw)
+        # A build can legitimately complete before a conservative pre-submit
+        # guard blocks Standard.  Its V2 INP is immutable evidence and can be
+        # resumed later; do not rebuild geometry or consume another FE start.
+        resume_inp_ready = (existing.get("Status") == "INP_READY" and
+                            not existing.get("Submitted") and
+                            bool(existing.get("Build_Result")) and
+                            bool(existing.get("INP_SHA256")))
+        if not resume_inp_ready:
+            raise RuntimeError("FAR_FIXED_BAND_PREVIOUS_ATTEMPT_NOT_RESUMABLE")
+
+    if shutil.disk_usage(run_root).free < 10.0 * 1024 ** 3:
+        raise RuntimeError("INSUFFICIENT_DISK_SPACE")
+
+    if resume_inp_ready:
+        job = existing
+        request = job["Request"]
+        built = job["Build_Result"]
+        inp_path = built.get("INP_Path")
+        folder = ensure_directory(os.path.dirname(job["Extract_Result_Path"]))
+        run_dir = request["Run_Directory"]
+        job_name = request["Job_Name"]
+        if not inp_path or not os.path.isfile(inp_path) or os.path.getsize(inp_path) == 0:
+            raise RuntimeError("STAGED_RESUME_INP_MISSING_OR_EMPTY")
+        if hashlib.sha256(open(inp_path, "rb").read()).hexdigest() != job["INP_SHA256"]:
+            raise RuntimeError("STAGED_RESUME_INPUT_HASH_CHANGED")
+        job.update({"Status": "INP_READY_RESUMED", "Resume_Reason": "PREVIOUS_PRE_SUBMIT_BLOCK"})
+        save_json(os.path.join(state_dir, "checkpoint.json"), state)
+    else:
+        folder = ensure_directory(os.path.join(state_dir, "staged"))
+        run_dir = os.path.join(run_root, "staged_far", sid)
+        if os.path.exists(run_dir):
+            raise RuntimeError("FAR_FIXED_BAND_UNREGISTERED_RUN_DIRECTORY_EXISTS")
+        job_name = "fb15_" + sid.replace("FB15SIZE_", "")
+        build_result_path = os.path.join(folder, sid + "_build_result.json")
+        extract_result_path = os.path.join(folder, sid + "_extract_result.json")
+        request = {
+            "Stage": "BUILD", "Candidate": candidate, "Run_Directory": run_dir,
+            "Job_Name": job_name, "Result_Path": build_result_path,
+        }
+        state["Jobs"][sid] = {
+            "Status": "BUILDING", "Submitted": False, "Request": request,
+            "Extract_Result_Path": extract_result_path,
+            "Submission_Mode": "STAGED_MANUAL_EQUIVALENT_FAR_FIXED_BAND",
+        }
+        save_json(os.path.join(state_dir, "checkpoint.json"), state)
+
+        # Stage A: generate the exact V2 INP, then CAE exits before Standard starts.
+        built = _staged_worker(request, folder)
+        inp_path = built.get("INP_Path")
+        if not inp_path or not os.path.isfile(inp_path) or os.path.getsize(inp_path) == 0:
+            raise RuntimeError("STAGED_BUILD_DID_NOT_PRODUCE_COMPLETE_INP")
+        job = state["Jobs"][sid]
+        job.update({"Status": "INP_READY", "Build_Result": built,
+                    "INP_SHA256": hashlib.sha256(open(inp_path, "rb").read()).hexdigest()})
+        save_json(os.path.join(state_dir, "checkpoint.json"), state)
+
+    # Both a fresh build and an INP_READY resume use the same durable
+    # extraction destination.  Keep it local before the solver call so a
+    # completed solver can always be post-processed without resubmission.
+    extract_result_path = job["Extract_Result_Path"]
+
+    # The user authorized the manual-equivalent single-job start policy: skip
+    # only the conservative 8/14 GiB startup gates.  Conflict/disk checks and
+    # sustained dual-critical in-run protection stay active.
+    resources = dict(config.STAGED_ISOLATED_RESOURCES)
+    resources.update(minimum_available_memory_gb=0.0, minimum_commit_headroom_gb=0.0)
+    preflight = _recovery_resource_check(resources)
+    if hashlib.sha256(open(inp_path, "rb").read()).hexdigest() != job["INP_SHA256"]:
+        raise RuntimeError("STAGED_INPUT_HASH_CHANGED_BEFORE_SUBMISSION")
+    scratch = ensure_directory(os.path.join(folder, "scratch"))
+    stale = [ext for ext in (".odb", ".lck", ".sta", ".msg")
+             if os.path.exists(os.path.join(run_dir, job_name + ext))]
+    if stale:
+        raise RuntimeError("STALE_SOLVER_OUTPUT_BEFORE_SUBMISSION:" + ",".join(stale))
+
+    command = ["abaqus", "job=" + job_name, "input=" + inp_path,
+               "cpus=1", "mp_mode=threads", "memory=90%",
+               "scratch=" + scratch, "interactive"]
+    submitted_epoch = time.time()
+    job.update({"Status": "SUBMITTED", "Submitted": True,
+                "Submitted_Epoch": submitted_epoch, "Command": command,
+                "Preflight": preflight, "Resource_Policy": resources})
+    save_json(os.path.join(state_dir, "checkpoint.json"), state)
+    execution = _staged_process(command, run_dir,
+                                os.path.join(folder, "solver_console.log"), resources)
+    job.update({"Status": "SOLVER_COMPLETED", "Execution": execution})
+    save_json(os.path.join(state_dir, "checkpoint.json"), state)
+
+    # Prove the actual command received the manual-equivalent CPU/memory mode
+    # before trusting its ODB.
+    com_path = os.path.join(run_dir, job_name + ".com")
+    if not os.path.isfile(com_path):
+        raise RuntimeError("ACTUAL_SOLVER_COMMAND_FILE_MISSING")
+    com_text = open(com_path, encoding="latin-1", errors="replace").read()
+    for token in ("'cpus':1,", "'memory':'90%'", "'mp_mode':THREADS,"):
+        if token not in com_text:
+            raise RuntimeError("ACTUAL_SOLVER_POLICY_DIFFERS:" + token)
+
+    # Stage C: fresh ODB-only extraction.  This verifies completion evidence,
+    # all positive modes through 500 Hz, masses, and the target error.
+    extract_request = dict(request, Stage="EXTRACT", Result_Path=extract_result_path,
+                           Build_Result=built,
+                           ODB_Path=os.path.join(run_dir, job_name + ".odb"),
+                           Submitted_Epoch=submitted_epoch,
+                           Solver_Log_Path=os.path.join(folder, "solver_console.log"))
+    raw = _staged_worker(extract_request, folder)
+    job.update({"Status": raw.get("Status"), "Extract_Request": extract_request})
+    state.setdefault("Raw_Results", {})[sid] = raw
+    save_json(os.path.join(state_dir, "checkpoint.json"), state)
+    return summarize_validation(candidate, raw)
+
+
 def validate_fixed_band_saved_candidate(candidate_id, candidate_csv=None):
     """Validate exactly one new 15 mm-band geometry with the V2 FE chain.
 
@@ -1878,7 +2722,14 @@ def validate_fixed_band_saved_candidate(candidate_id, candidate_csv=None):
                "output_name": os.path.basename(validation_csv),
                "policy": fixed_policy, "preserve_large_artifacts": True}
     try:
-        record = validate_one(candidate, state, state_dir, runtime=runtime)
+        # Far/direct-global candidates must use the staged route.  It
+        # releases CAE before Standard begins and matches the known-good manual
+        # submission policy.  Older candidates retain their existing path.
+        if candidate_id.startswith(("FB15SIZE_", "FB15DIR_")):
+            record = _validate_far_fixed_band_candidate_staged(
+                candidate, state, state_dir, run_root)
+        else:
+            record = validate_one(candidate, state, state_dir, runtime=runtime)
         state["Status"] = record.get("Status", "UNKNOWN")
     except Exception as exc:
         import traceback
@@ -1904,7 +2755,8 @@ def validate_fixed_band_saved_candidate(candidate_id, candidate_csv=None):
         validation_csv, _ = rebuild_fixed_band_validation_ledger()
         write_fixed_band_user_validation_table(validation_csv, [candidate_id])
 
-    submitted = bool(state.get("Jobs", {}).get(candidate_id, {}).get("PID"))
+    submitted = bool(state.get("Jobs", {}).get(candidate_id, {}).get("PID") or
+                     state.get("Jobs", {}).get(candidate_id, {}).get("Submitted"))
     result = dict(record, Abaqus_Job_Submitted=submitted,
                   Validation_CSV=validation_csv)
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
@@ -3016,8 +3868,15 @@ def _recovery_resource_check(resource_policy=None):
     from paths import TARGET_DRIVEN_RUNS_DIR
     r=resource_policy or config.TARGET_RECOVERY_RESOURCES
     snapshot=_windows_memory_snapshot()
-    snapshot["E_Free_GB"]=shutil.disk_usage(TARGET_DRIVEN_RUNS_DIR).free/1024**3
-    query="Get-CimInstance Win32_Process | Where-Object {$_.Name -match '^(standard|explicit|pre|ABQcaeK|SMAPython)\\.exe$'} | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"
+    # The staged isolated validator is also used for a fresh fixed-band run
+    # before any target-driven directory exists.  Creating this empty approved
+    # root is harmless and avoids mistaking a missing directory for a resource
+    # shortage.
+    snapshot["E_Free_GB"]=shutil.disk_usage(ensure_directory(TARGET_DRIVEN_RUNS_DIR)).free/1024**3
+    # An idle CAE GUI (ABQcaeK/SMAPython) is not a running solver.  Blocking
+    # it prevented safe independent Standard submission after Stage A.  Only
+    # actual input-processing/solver executables are submission conflicts.
+    query="Get-CimInstance Win32_Process | Where-Object {$_.Name -match '^(standard|explicit|pre|SMAEqsDirSolverSymmetric|SMAEqsDirSolverUnsymmetric|SMAExternal)\\.exe$'} | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"
     snapshot["Solver_Processes"]=_powershell_json(query)
     if snapshot["Solver_Processes"]:raise RuntimeError("CONFLICTING_ABAQUS_PROCESS_NO_SUBMISSION")
     if snapshot["Available_RAM_GB"]<r["minimum_available_memory_gb"]:raise RuntimeError("RAM_BELOW_POLICY_THRESHOLD:"+str(snapshot))

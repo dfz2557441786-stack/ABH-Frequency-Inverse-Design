@@ -10,8 +10,8 @@ from __future__ import print_function
 import os
 
 from paths import (DATABASE_DATA_DIR, DATABASE_MODEL_DIR, LOG_DIR, PROJECT_ROOT,
-                   RESULTS_DIR, VERIFIED_SOURCE_ROOT, GENERAL_DESIGN_BOUNDS_FILE,
-                   DOCS_DIR)
+                   RESULTS_DIR, VERIFIED_SOURCE_ROOT, HOST_REFERENCE_ROOT,
+                   GENERAL_DESIGN_BOUNDS_FILE, DOCS_DIR)
 
 # Relative error allowed for each of the first six frequencies: 0.5 %.
 FREQUENCY_RELATIVE_ERROR_TOLERANCE = 0.005
@@ -108,6 +108,25 @@ CONTROLLED_COUPLED_MODAL_POLICY = {
 # platform_height; no fixed translation is physically valid across the 11D
 # database.
 V2_HOST_RABH_INTERFACE_RULE = "RABH_PLATFORM_SNEG_TO_PLATE_SPOS_H_CENTER_ALIGNED_V4"
+# Read-only Fig.4.4 Host reference.  This is intentionally distinct from
+# ``VERIFIED_SOURCE_ROOT``, which remains the source of the current V2 ABH
+# geometry/material/thickness-field chain.
+FIG44_HOST_REFERENCE_ROOT = HOST_REFERENCE_ROOT
+
+# Locked Fig.4.4 Host reference.  Only the candidate V2 RABH geometry may
+# vary in coupled-modal screening; the plate and in-plane placement remain
+# fixed.  ``plate_z`` is deliberately omitted because it must be derived as
+# ``-platform_height`` for every candidate's physical SNEG--SPOS interface.
+COUPLED_V2_HOST_REFERENCE = {
+    "plate_length": 0.350,
+    "plate_width": 0.200,
+    "plate_height": 0.005,
+    "plate_translation_x": -0.160,
+    "plate_translation_y": 0.0,
+    "plate_material_density": 2700.0,
+    "plate_elastic": 69.0e9,
+    "plate_poisson": 0.33,
+}
 
 # Single source for the existing Fig.4.4 Host plus current-V2-RABH damping
 # definitions.  These values match the locked Host builder and V2 Shell_create

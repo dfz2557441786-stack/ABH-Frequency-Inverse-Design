@@ -107,7 +107,11 @@ def extract_staged_modal(request):
     # the controller console instead of creating a per-job .log file.  The
     # solver console is owned by this staged job and is an equivalent record;
     # never treat the optional .log filename alone as a solver failure.
-    log_path=stem+".log"
+    # A staged ``abaqus job=... interactive`` submission writes its controller
+    # log outside the run directory.  The controller passes the exact owned
+    # path, so extraction can verify solver completion without guessing a
+    # sibling directory from the ODB path.
+    log_path=request.get("Solver_Log_Path") or stem+".log"
     if not os.path.isfile(log_path):
         log_path=os.path.join(os.path.dirname(os.path.dirname(odb_path)),"solver_console.log")
     if not os.path.isfile(log_path):

@@ -39,6 +39,18 @@ def main(design_mode=None):
             design_request.FIXED_BAND_DATASET_CSV,
             design_request.FAR_SEARCH_POLICY,
             _shell_size_bounds_from_request())
+    # 直接全局多解反演：不要求数据库中已有频率锚点；只生成待验证参数，
+    # 不提交 Abaqus。锚点局部生成 ``GENERATE`` 保留为高可信近邻路线。
+    if design_mode == "GENERATE_DIRECT":
+        if design_request.DATA_LIBRARY != "FIXED_BAND_15MM_V2":
+            raise ValueError("DIRECT_GLOBAL_SEARCH_REQUIRES_FIXED_BAND_15MM_V2")
+        from frequency_generation import run_fixed_band_direct_global_generation
+        return run_fixed_band_direct_global_generation(
+            design_request.TARGET_FREQUENCY_HZ,
+            design_request.GENERATIVE_ADDITIONAL_TARGETS_HZ,
+            design_request.FIXED_BAND_DATASET_CSV,
+            design_request.FAR_SEARCH_POLICY,
+            _shell_size_bounds_from_request())
     if design_mode in ("MODEL_CHECK", "ANCHOR_CHECK"):
         if getattr(design_request, "DATA_LIBRARY", "") != "FIXED_BAND_15MM_V2":
             raise ValueError("MODEL_CHECK_REQUIRES_FIXED_BAND_15MM_V2")
@@ -49,6 +61,23 @@ def main(design_mode=None):
             design_request.GENERATIVE_ADDITIONAL_TARGETS_HZ,
             design_request.FIXED_BAND_DATASET_CSV,
         )
+    # 将已经完成的 FE 验证整理为反馈库；只读台账，不训练、不生成、不提交 Abaqus。
+    if design_mode == "VALIDATION_FEEDBACK":
+        if getattr(design_request, "DATA_LIBRARY", "") != "FIXED_BAND_15MM_V2":
+            raise ValueError("VALIDATION_FEEDBACK_REQUIRES_FIXED_BAND_15MM_V2")
+        from frequency_generation import build_fixed_band_validation_feedback
+        return build_fixed_band_validation_feedback()
+    if design_mode == "VALIDATION_SPECTRUM_RECOVERY":
+        if getattr(design_request, "DATA_LIBRARY", "") != "FIXED_BAND_15MM_V2":
+            raise ValueError("VALIDATION_SPECTRUM_RECOVERY_REQUIRES_FIXED_BAND_15MM_V2")
+        from frequency_generation import recover_fixed_band_validation_spectra
+        return recover_fixed_band_validation_spectra()
+    if design_mode == "VALIDATION_BACKFILL_COMPLETE24":
+        if getattr(design_request, "DATA_LIBRARY", "") != "FIXED_BAND_15MM_V2":
+            raise ValueError("VALIDATION_BACKFILL_COMPLETE24_REQUIRES_FIXED_BAND_15MM_V2")
+        from frequency_generation import append_complete_validation_spectra_to_fixed_band_dataset
+        return append_complete_validation_spectra_to_fixed_band_dataset(
+            design_request.FIXED_BAND_DATASET_CSV)
     # 批量验证优先于单候选验证：候选 ID 由用户配置文件显式指定，按顺序串行提交。
     if getattr(design_request, "VALIDATE_BATCH_NEW_CANDIDATES", False):
         candidate_csv = getattr(design_request, "BATCH_VALIDATION_CANDIDATE_CSV", "").strip() or None
@@ -123,6 +152,6 @@ def main(design_mode=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--design-mode", choices=("RETRIEVAL","GENERATE","GENERATE_FAR","MODEL_CHECK","ANCHOR_CHECK","VALIDATE","GENERATE_AND_VALIDATE"))
+    parser.add_argument("--design-mode", choices=("RETRIEVAL","GENERATE","GENERATE_FAR","GENERATE_DIRECT","MODEL_CHECK","ANCHOR_CHECK","VALIDATION_FEEDBACK","VALIDATION_SPECTRUM_RECOVERY","VALIDATION_BACKFILL_COMPLETE24","VALIDATE","GENERATE_AND_VALIDATE"))
     args = parser.parse_args()
     main(args.design_mode)
